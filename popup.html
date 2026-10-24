@@ -36,7 +36,9 @@
           />
         </div>
         <ul id="results" class="results" role="listbox" aria-label="Matching tabs" hidden></ul>
-        <p id="results-empty" class="results-empty" hidden>No open tab matches that. Try fewer words.</p>
+        <p id="results-empty" class="results-empty" hidden>
+          Nothing matches yet. Describe it the way you remember it, like “rust async article” or “that recipe video”.
+        </p>
       </section>
 
       <div id="dashboard" class="dashboard">
@@ -71,6 +73,12 @@
           <summary class="history-summary">Recently archived (<span id="history-count">0</span>)</summary>
           <ul id="history-list" class="history-list"></ul>
         </details>
+
+        <footer class="memory">
+          <span id="memory-status" class="memory-status">Remembering pages on this device</span>
+          <button id="memory-pause" class="link-btn" type="button">Pause</button>
+          <button id="memory-clear" class="link-btn" type="button">Clear</button>
+        </footer>
       </div>
 
       <p id="toast" class="toast" role="status" aria-live="polite" hidden></p>
