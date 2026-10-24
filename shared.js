@@ -117,7 +117,8 @@ export function normalizeUrl(url) {
 
 // ---------------------------------------------------------------------------------------------
 // Page memory: an IndexedDB store of what visited pages were about, so closed pages stay findable.
-// Record: { url, title, host, favIconUrl, description, headings, keywords: string[], firstSeen, lastVisited }
+// Record: { url, title, host, favIconUrl, description, headings, keywords: string[] (most frequent first),
+//          keywordCounts: number[] (occurrences of each keyword), firstSeen, lastVisited }
 // ---------------------------------------------------------------------------------------------
 
 export const PAGE_MEMORY_LIMIT = 3000;

@@ -282,6 +282,11 @@ async function withRetry(operation, attempts = 3) {
 const TOPIC_PREFIX = '🔍 ';
 const TOPIC_JOIN = 0.3; // similarity needed to form or join a topic
 const TOPIC_STAY = 0.15; // lower bar to stay in one, so groups do not flicker
+// Pages sharing a key term must also overlap this much in their other words (raw word weights, so
+// it does not swing with the size of page memory). A word with two meanings ("rust" the language
+// vs. rust on cast iron) or a generic one ("recipe") is not enough on its own.
+const KEY_TERM_CONTEXT = 0.09;
+const KEY_TERMS_PER_PAGE = 8;
 const WEB_NOISE = new Set(
   [
     'sign', 'login', 'log', 'menu', 'search', 'home', 'cookie', 'cookies', 'privacy', 'policy', 'terms',
@@ -292,6 +297,11 @@ const WEB_NOISE = new Set(
     'watch', 'question', 'questions', 'answer', 'answers', 'asked', 'modified', 'viewed', 'tagged',
     'issue', 'issues', 'pull', 'request', 'requests', 'wikipedia', 'free', 'encyclopedia', 'article',
     'blog', 'post', 'posts', 'min', 'minute', 'minutes', 'ago', 'year', 'years', 'day', 'days',
+    // Generic words that appear on pages about anything.
+    'first', 'second', 'third', 'make', 'made', 'good', 'great', 'well', 'really', 'time', 'thing',
+    'things', 'want', 'need', 'try', 'keep', 'start', 'ask', 'know', 'think', 'look', 'right',
+    'left', 'easy', 'hard', 'lot', 'sure', 'way', 'give', 'take', 'come', 'going', 'bit', 'even',
+    'still', 'every', 'without', 'always', 'never', 'often', 'usually', 'example', 'yes', 'okay',
   ].map(stem),
 );
 
@@ -326,6 +336,9 @@ function siteBoilerplate(corpus) {
   return boilerplate;
 }
 
+/** Numbers, hashes and IDs ("6adc5e35", "2024") say nothing about a topic. */
+const isIdLike = (word) => /^\d+$/.test(word) || (/\d/.test(word) && word.length >= 6);
+
 /** Weighted term profile of one tab, plus the readable spelling of each stem (for labels). */
 function topicProfile(tab, page, boilerplate) {
   const url = tabUrl(tab);
@@ -341,7 +354,7 @@ function topicProfile(tab, page, boilerplate) {
   const keep = (s) => s.length >= 3 && !siteWords.has(s) && !WEB_NOISE.has(s) && !siteText?.terms.has(s);
   const addText = (text, weight) => {
     for (const word of tokenize(text)) {
-      if (word.length < 3 || STOPWORDS.has(word) || /^\d+$/.test(word)) continue;
+      if (word.length < 3 || STOPWORDS.has(word) || isIdLike(word)) continue;
       const s = stem(word);
       if (!keep(s)) continue;
       weights.set(s, (weights.get(s) ?? 0) + weight);
@@ -350,16 +363,38 @@ function topicProfile(tab, page, boilerplate) {
   };
   addText(tab.title, 3);
   const headings = (page?.headings ?? '').split(' · ').filter((h) => !siteText?.headings.has(h.trim().toLowerCase()));
-  addText(headings.join(' '), 2);
+  addText(headings.join(' '), 1.5);
   if (!siteText?.descriptions.has((page?.description ?? '').trim().toLowerCase())) addText(page?.description, 2);
   try {
     addText(new URL(url).pathname.replace(/[-_/.]+/g, ' '), 1);
   } catch {}
-  // Page words are stored most frequent first; the words a page keeps repeating carry its topic.
+  // The words a page keeps repeating carry its topic, so page words weigh by how often they occur
+  // (log-scaled). Pages remembered before counts were stored fall back to their frequency rank.
   (page?.keywords ?? []).forEach((s, rank) => {
-    if (keep(s)) weights.set(s, (weights.get(s) ?? 0) + 2 / (1 + rank / 8));
+    if (!keep(s) || isIdLike(s)) return;
+    const count = page.keywordCounts?.[rank];
+    const weight = count ? 1 + Math.log(count) : 2 / (1 + rank / 8);
+    weights.set(s, (weights.get(s) ?? 0) + weight);
   });
-  return { weights, surface };
+
+  // Key terms: the few words a page repeats most, plus its title words. Two chats about guitars
+  // can share little else ("F chord" vs "buying an acoustic"), but both keep saying "guitar".
+  const prominence = new Map();
+  (page?.keywords ?? []).forEach((s, rank) => {
+    if (keep(s) && !isIdLike(s)) prominence.set(s, page.keywordCounts?.[rank] ?? Math.max(1, 6 - rank / 5));
+  });
+  for (const word of tokenize(tab.title)) {
+    const s = stem(word);
+    if (word.length >= 3 && !STOPWORDS.has(word) && !isIdLike(word) && keep(s)) prominence.set(s, (prominence.get(s) ?? 0) + 3);
+  }
+  const keyTerms = new Set(
+    [...prominence]
+      .filter(([, score]) => score >= 3)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, KEY_TERMS_PER_PAGE)
+      .map(([s]) => s),
+  );
+  return { weights, surface, keyTerms, url: normalizeUrl(url) };
 }
 
 /** Turns raw profiles into unit-length TF-IDF vectors, using page memory as the document corpus. */
@@ -368,9 +403,12 @@ function vectorize(profiles, corpus) {
   const count = (terms) => {
     for (const s of new Set(terms)) df.set(s, (df.get(s) ?? 0) + 1);
   };
+  const remembered = new Set(corpus.map((page) => page.url));
   for (const page of corpus) count([...(page.keywords ?? []), ...contentStems(page.title)]);
-  for (const profile of profiles) count(profile.weights.keys());
-  const n = corpus.length + profiles.length;
+  // Open tabs already in page memory are in the corpus; count only the ones that are not.
+  const unseen = profiles.filter((profile) => !remembered.has(profile.url));
+  for (const profile of unseen) count(profile.weights.keys());
+  const n = corpus.length + unseen.length;
   for (const profile of profiles) {
     const vector = new Map();
     let norm = 0;
@@ -383,6 +421,7 @@ function vectorize(profiles, corpus) {
     for (const [s, value] of vector) vector.set(s, value / norm);
     profile.vector = vector;
   }
+  return { df, n };
 }
 
 function cosine(a, b) {
@@ -402,28 +441,50 @@ function centroid(members) {
   return sum;
 }
 
-/** Up to two words most shared across the members, e.g. "🔍 Rust async". */
+/** The words most shared across the members, key terms first, e.g. "🔍 Rust async" or "🔍 Guitar". */
 function topicLabel(members) {
-  const shared = new Map();
-  for (const { vector } of members) for (const [s, v] of vector) shared.set(s, (shared.get(s) ?? 0) + v);
-  const inMany = [...shared]
-    .filter(([s]) => members.filter((m) => m.vector.has(s)).length >= Math.max(2, Math.ceil(members.length / 2)))
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 2)
-    .map(([s]) => members.find((m) => m.surface.has(s))?.surface.get(s) ?? s);
-  if (!inMany.length) return null;
-  const label = inMany.join(' ');
+  const need = Math.max(2, Math.ceil(members.length / 2));
+  const sharedBy = (s, field) => members.filter((m) => m[field].has(s)).length;
+  const weight = new Map();
+  for (const { vector } of members) for (const [s, v] of vector) weight.set(s, (weight.get(s) ?? 0) + v);
+  const ranked = [...weight]
+    .filter(([s]) => sharedBy(s, 'vector') >= need)
+    .map(([s, w]) => ({ s, w, key: sharedBy(s, 'keyTerms') >= need }))
+    .sort((a, b) => b.key - a.key || b.w - a.w);
+  if (!ranked.length) return null;
+  const [first, second] = ranked;
+  // A second word only when it is just as central to the members, so a label never reads like a
+  // sub-topic of one page ("Guitar", not "Guitar chord").
+  const words = second && (first.key ? second.key : second.w >= 0.6 * first.w) ? [first, second] : [first];
+  const label = words.map(({ s }) => members.find((m) => m.surface.has(s))?.surface.get(s) ?? s).join(' ');
   return TOPIC_PREFIX + label.charAt(0).toUpperCase() + label.slice(1);
 }
 
-/**
- * Assigns topic groups. Existing topic members stay while they still fit; other tabs join the
- * closest existing topic; the rest form new topics around the best-connected tab.
- */
-function assignTopics(candidates, registry) {
-  const assignment = new Map(); // tabId -> { key, title }
-  const topics = new Map(); // key -> { title, members }
+/** Cosine similarity of two vectors after removing some terms (and renormalizing). */
+function cosineWithout(a, b, drop) {
+  const trim = (vector) => {
+    const kept = [...vector].filter(([s]) => !drop.has(s));
+    const norm = Math.sqrt(kept.reduce((sum, [, v]) => sum + v * v, 0)) || 1;
+    return new Map(kept.map(([s, v]) => [s, v / norm]));
+  };
+  return cosine(trim(a), trim(b));
+}
 
+/**
+ * Assigns topic groups. Two tabs are related when their word profiles are similar overall, or when
+ * they share a key term that is uncommon across the user's pages and their other words still
+ * overlap (two guitar chats both mention strings, chords and capos).
+ * Existing topic members stay while they still fit; other tabs join the closest fitting topic; the
+ * rest form new topics around the best-connected tab.
+ */
+function assignTopics(candidates, registry, isRare) {
+  const related = (a, b) => {
+    if (cosine(a.vector, b.vector) >= TOPIC_JOIN) return true;
+    const shared = new Set([...a.keyTerms].filter((s) => b.keyTerms.has(s) && isRare(s)));
+    return shared.size > 0 && cosineWithout(a.weights, b.weights, shared) >= KEY_TERM_CONTEXT;
+  };
+
+  const topics = new Map(); // key -> { title, members }
   for (const c of candidates) {
     const key = registry[c.tab.groupId]?.key;
     if (!key?.startsWith('topic:')) continue;
@@ -431,25 +492,28 @@ function assignTopics(candidates, registry) {
     topics.get(key).members.push(c);
   }
   for (const [key, topic] of topics) {
-    topic.members = topic.members.filter(
-      (m) => topic.members.length > 1 && cosine(m.vector, centroid(topic.members.filter((o) => o !== m))) >= TOPIC_STAY,
-    );
+    topic.members = topic.members.filter((m) => {
+      const others = topic.members.filter((o) => o !== m);
+      return others.length > 0 && (cosine(m.vector, centroid(others)) >= TOPIC_STAY || others.some((o) => related(m, o)));
+    });
     if (topic.members.length < MIN_GROUP_SIZE) topics.delete(key);
   }
+  const inTopic = (c) => [...topics.values()].some((t) => t.members.includes(c));
 
   for (const c of candidates) {
-    if ([...topics.values()].some((t) => t.members.includes(c))) continue;
+    if (inTopic(c)) continue;
     let best = null;
-    let bestScore = TOPIC_JOIN;
+    let bestScore = -1;
     for (const topic of topics.values()) {
-      const score = cosine(c.vector, centroid(topic.members));
-      if (score >= bestScore) [best, bestScore] = [topic, score];
+      const similarity = cosine(c.vector, centroid(topic.members));
+      const fits = similarity >= TOPIC_JOIN || 2 * topic.members.filter((m) => related(c, m)).length >= topic.members.length;
+      if (fits && similarity > bestScore) [best, bestScore] = [topic, similarity];
     }
     best?.members.push(c);
   }
 
-  const rest = candidates.filter((c) => ![...topics.values()].some((t) => t.members.includes(c)));
-  const neighbors = rest.map((c) => rest.filter((d) => d !== c && cosine(c.vector, d.vector) >= TOPIC_JOIN));
+  const rest = candidates.filter((c) => !inTopic(c));
+  const neighbors = rest.map((c) => rest.filter((d) => d !== c && related(c, d)));
   const used = new Set();
   const order = rest.map((_, i) => i).sort((a, b) => neighbors[b].length - neighbors[a].length);
   for (const i of order) {
@@ -465,6 +529,7 @@ function assignTopics(candidates, registry) {
     topics.set(key, topic);
   }
 
+  const assignment = new Map(); // tabId -> { key, title }
   for (const [key, { title, members }] of topics) for (const m of members) assignment.set(m.tab.id, { key, title });
   return assignment;
 }
@@ -522,8 +587,10 @@ async function regroupWindow(windowId, changed) {
     tab,
     ...topicProfile(tab, pagesByUrl.get(normalizeUrl(tabUrl(tab))), boilerplate),
   }));
-  vectorize(candidates, corpus);
-  const topicOf = assignTopics(candidates, registry);
+  const { df, n } = vectorize(candidates, corpus);
+  // A key term only links pages if it is not on a large share of everything the user reads.
+  const isRare = (s) => n < 10 || (df.get(s) ?? 0) / n <= 0.3;
+  const topicOf = assignTopics(candidates, registry, isRare);
   for (const tab of eligible) {
     const topic = topicOf.get(tab.id);
     if (topic) place(topic.key, topic.title, tab);
@@ -746,7 +813,10 @@ async function indexTab(tabId) {
     favIconUrl: /^https?:/.test(tab.favIconUrl ?? '') ? tab.favIconUrl : '',
     description: page.description,
     headings: page.headings,
-    keywords: [...counts].sort((a, b) => b[1] - a[1]).slice(0, KEYWORDS_PER_PAGE).map(([s]) => s),
+    ...(() => {
+      const top = [...counts].sort((a, b) => b[1] - a[1]).slice(0, KEYWORDS_PER_PAGE);
+      return { keywords: top.map(([s]) => s), keywordCounts: top.map(([, n]) => n) };
+    })(),
     lastVisited: Date.now(),
   });
   scheduleRegroup(tab.windowId, tabId); // new content may reveal a cross-site topic
