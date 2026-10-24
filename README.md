@@ -14,6 +14,7 @@ Everything runs inside your browser. No account, no servers, no data leaves your
 
 - **Groups your tabs automatically.**
   - Tabs are grouped by **what the pages are about**, first and foremost. A tutorial, a blog post, and a forum question about the same thing go into `🔍 Rust async`. Two ChatGPT chats, one asking "is Claude Code the best?" and one asking "who created Claude Code?", go into `🔍 Claude code`.
+  - It works for pages whose content loads after they open: AI chats, search results, shopping searches. What you searched for or asked counts most, and groups update as soon as the content arrives. Two ChatGPT chats about guitar chords and a guitar-strings search on a shop go into `🔍 Guitar`.
   - Tabs that share no topic are grouped by website (`GitHub`, `Python`, …). Sites full of unrelated content (YouTube, Google, Stack Overflow, ChatGPT, Claude, Perplexity) get groups by subject such as `YouTube · lofi`, and their leftover tabs share one site group.
 - **Finds any page by what you remember.** Type a few words, like "rust article about pinning", "that piano video", or "bread starter recipe". It searches your open tabs and pages you closed earlier, including the words inside the pages, not just their titles.
 - **Reminds you about forgotten tabs.** A tab you have not looked at for 2+ hours counts as "stale". The toolbar icon shows how many you have, and you get a gentle reminder now and then.
@@ -146,6 +147,7 @@ Go to `chrome://extensions` and click **Remove** on the TabDeclutter card. This 
 
 - Everything is stored in your own browser. Nothing is uploaded, and there are no accounts, analytics, or ads.
 - To group by topic and search inside pages, TabDeclutter reads each page's title, description, headings, and most frequent words. Chrome describes this permission as "Read and change all your data on all websites". TabDeclutter only reads, and it keeps a short summary per page, not the full text.
+- TabDeclutter also notes what you searched for or asked on a page (the search box and the messages you sent in AI chats), so it can group and find the page by it. It never reads what you are still typing.
 - Pages with a password field (such as login and banking pages) are never remembered, and incognito windows are ignored.
 - You can pause or clear page memory at any time from the popup.
 
@@ -156,11 +158,12 @@ Go to `chrome://extensions` and click **Remove** on the TabDeclutter card. This 
 | `manifest.json` | Manifest V3 configuration and permissions. |
 | `background.js` | Service worker: last-access tracking, page memory indexing, the topic and site grouping engine, badge, and notifications. |
 | `popup.html` / `popup.js` | Dashboard, cleanup actions, page memory controls, and the command bar search. |
+| `watch.js` | Injected into readable pages; asks for a fresh read when the page's content changes and then settles. It sends no page content itself. |
 | `shared.js` | Storage keys, thresholds, text helpers, and the IndexedDB page memory used by both contexts. |
 | `styles.css` | All styles; no remote assets, so it works under the strict extension CSP. |
 
 How it decides:
-- **Topics**: each tab gets a TF-IDF word profile from its title, headings, description, URL, and frequent page words. Text a site repeats on many pages (shared descriptions, navigation headings, interface words) is ignored, and page words weigh by how often they occur. Tabs form a topic group when their profiles are similar overall, or when they share a key term (one of the words each page repeats most) and their other words still overlap, which keeps homonyms like Rust the language and rust on a pan apart. Topics form on the same site or across sites and take priority over site groups. Pages are re-read when their title changes and when you switch away from them, so chat answers that stream in are captured. Only tabs that are ungrouped, just navigated, or sit in a topic or general catch-all group are re-evaluated, and a group left with one tab dissolves.
+- **Topics**: each tab gets a TF-IDF word profile from its title, the search query in its URL, what the user searched or asked on the page, headings, description, URL, and frequent page words. Text a site repeats on many pages (shared titles and descriptions, navigation headings, interface words) is ignored, and page words weigh by how often they occur. Tabs form a topic group when their profiles are similar overall, or when they share a key term (one of the words each page repeats most) and their other words still overlap (one shared word alone is never enough), which keeps homonyms like Rust the language and rust on a pan apart. Topics form on the same site or across sites and take priority over site groups. Pages are re-read on load, when their title changes, when you switch away from them, and when `watch.js` sees their content change by a meaningful amount and then settle (at most once every 10 seconds; ticking clocks and live counters are ignored). Topics formed from half-loaded pages merge once the pages turn out to be one subject, and topic labels refresh unless you renamed the group. Only tabs that are ungrouped, just navigated, or sit in a topic or general catch-all group are re-evaluated, and a group left with one tab dissolves.
 - **Stale**: the last time each tab was in the foreground is tracked in `chrome.storage.local`; a background tab is stale after 2 hours.
 - **Search**: scores title, site, URL, and remembered page words, with light word-stemming, typo tolerance, site-type words (video, spreadsheet, email, …), and extra weight for GitHub on code-related queries.
 

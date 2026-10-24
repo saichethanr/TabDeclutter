@@ -90,11 +90,14 @@ export function tokenize(text) {
 /** Light suffix stripping so "videos"/"video" and "watching"/"watch" meet. */
 export function stem(word) {
   if (word.length > 4 && word.endsWith('ies')) return `${word.slice(0, -3)}y`;
-  if (word.length > 5 && word.endsWith('ing')) return word.slice(0, -3);
-  if (word.length > 4 && word.endsWith('ed')) return word.slice(0, -2);
   if (word.length > 4 && /(ss|x|z|ch|sh)es$/.test(word)) return word.slice(0, -2);
-  if (word.length > 3 && word.endsWith('s') && !word.endsWith('ss')) return word.slice(0, -1);
-  return word;
+  // Plural first, so "strings" and "string" (and "buildings" and "building") end up the same.
+  if (word.length > 3 && word.endsWith('s') && !word.endsWith('ss')) word = word.slice(0, -1);
+  // "-ing"/"-ed" only when a real stem is left ("string" and "shred" stay), undoubling "runn".
+  const suffix = word.length > 5 && word.endsWith('ing') ? 3 : word.length > 4 && word.endsWith('ed') ? 2 : 0;
+  const base = word.slice(0, word.length - suffix);
+  if (!suffix || !/[aeiouy]/.test(base)) return word;
+  return /([bgmnprt])\1$/.test(base) ? base.slice(0, -1) : base;
 }
 
 /** Stems of the meaningful words in `text`. */
@@ -102,6 +105,20 @@ export function contentStems(text) {
   return tokenize(text)
     .filter((w) => w.length >= 3 && !STOPWORDS.has(w) && !/^\d+$/.test(w))
     .map(stem);
+}
+
+// URL parameters that carry what the user typed into a site's search box.
+const SEARCH_PARAMS = ['q', 'query', 'search_query', 'search', 'searchterm', 'search_term', 'keyword', 'keywords', 'k', 'term', 'wd'];
+
+/** The search typed on a results page, read from its URL ("…/results?search_query=guitar+strings"). */
+export function searchQueryFromUrl(url) {
+  try {
+    const params = new URL(url).searchParams;
+    for (const [name, value] of params) {
+      if (SEARCH_PARAMS.includes(name.toLowerCase()) && /\p{L}/u.test(value)) return value.trim().slice(0, 200);
+    }
+  } catch {}
+  return '';
 }
 
 /** Pages are remembered per URL without the #fragment. */
@@ -117,7 +134,8 @@ export function normalizeUrl(url) {
 
 // ---------------------------------------------------------------------------------------------
 // Page memory: an IndexedDB store of what visited pages were about, so closed pages stay findable.
-// Record: { url, title, host, favIconUrl, description, headings, keywords: string[] (most frequent first),
+// Record: { url, title, host, favIconUrl, description, headings, intent (what the user searched or asked
+//          on the page), keywords: string[] (most frequent first),
 //          keywordCounts: number[] (occurrences of each keyword), firstSeen, lastVisited }
 // ---------------------------------------------------------------------------------------------
 

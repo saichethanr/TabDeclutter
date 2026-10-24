@@ -14,6 +14,7 @@ import {
   isStale,
   normalizeUrl,
   pageMemory,
+  searchQueryFromUrl,
   stem,
   tabUrl,
   tokenize,
@@ -310,9 +311,23 @@ const WEB_NOISE = new Set(
  * (every ChatGPT chat has the same one), navigation headings, and interface words. Learned per site
  * from page memory.
  */
-function siteBoilerplate(corpus) {
+function siteBoilerplate(corpus, tabs) {
   const sites = new Map(); // domain -> { pages, descriptions, headings, terms }
   const bump = (map, key) => map.set(key, (map.get(key) ?? 0) + 1);
+  // A title shared by different pages of one site ("ShopKart: Online Shopping", "ChatGPT") names
+  // the site, not the page, so it must not link those pages into a topic.
+  const titleUrls = new Map(); // domain -> title -> Set(url)
+  const addTitle = (url, title) => {
+    const domain = getRootDomain(url);
+    if (!domain || !title?.trim()) return;
+    if (!titleUrls.has(domain)) titleUrls.set(domain, new Map());
+    const byTitle = titleUrls.get(domain);
+    const key = title.trim().toLowerCase();
+    if (!byTitle.has(key)) byTitle.set(key, new Set());
+    byTitle.get(key).add(normalizeUrl(url));
+  };
+  for (const page of corpus) addTitle(page.url, page.title);
+  for (const tab of tabs) addTitle(tabUrl(tab), tab.title);
   for (const page of corpus) {
     const domain = getRootDomain(page.url);
     if (!domain) continue;
@@ -324,13 +339,15 @@ function siteBoilerplate(corpus) {
     for (const s of new Set(page.keywords ?? [])) bump(site.terms, s);
   }
   const boilerplate = new Map();
-  for (const [domain, site] of sites) {
-    const repeated = (map, min) => new Set([...map].filter(([, n]) => n >= min).map(([text]) => text));
+  const repeated = (map, min) => new Set([...(map ?? [])].filter(([, n]) => n >= min).map(([text]) => text));
+  for (const domain of new Set([...sites.keys(), ...titleUrls.keys()])) {
+    const site = sites.get(domain);
     boilerplate.set(domain, {
-      descriptions: repeated(site.descriptions, 2),
-      headings: repeated(site.headings, 3),
+      descriptions: repeated(site?.descriptions, 2),
+      headings: repeated(site?.headings, 3),
       // With enough pages, words on most of a site's pages are interface text.
-      terms: site.pages >= 5 ? repeated(site.terms, Math.ceil(site.pages * 0.6)) : new Set(),
+      terms: site?.pages >= 5 ? repeated(site.terms, Math.ceil(site.pages * 0.6)) : new Set(),
+      titles: new Set([...(titleUrls.get(domain) ?? [])].filter(([, urls]) => urls.size >= 2).map(([title]) => title)),
     });
   }
   return boilerplate;
@@ -347,10 +364,14 @@ function topicProfile(tab, page, boilerplate) {
   try {
     host = new URL(url).hostname;
   } catch {}
-  const siteWords = new Set([...tokenize(host), ...tokenize(domainLabel(domain)), ...(TITLE_NOISE[domain] ?? [])].map(stem));
+  const siteText = boilerplate.get(domain);
+  // Words of a title the site gives many pages ("AskBot", "ShopKart: Online Shopping") name the site.
+  const siteTitleWords = [...(siteText?.titles ?? [])].flatMap((title) => tokenize(title));
+  const siteWords = new Set(
+    [...tokenize(host), ...tokenize(domainLabel(domain)), ...(TITLE_NOISE[domain] ?? []), ...siteTitleWords].map(stem),
+  );
   const weights = new Map();
   const surface = new Map();
-  const siteText = boilerplate.get(domain);
   const keep = (s) => s.length >= 3 && !siteWords.has(s) && !WEB_NOISE.has(s) && !siteText?.terms.has(s);
   const addText = (text, weight) => {
     for (const word of tokenize(text)) {
@@ -361,7 +382,13 @@ function topicProfile(tab, page, boilerplate) {
       if (!surface.has(s)) surface.set(s, word);
     }
   };
-  addText(tab.title, 3);
+  // What the user searched or asked is the clearest statement of a page's theme, and the URL's
+  // search query is known even before the page loads (or for tabs Chrome has not loaded yet).
+  const query = searchQueryFromUrl(url);
+  const title = siteText?.titles.has((tab.title ?? '').trim().toLowerCase()) ? '' : tab.title;
+  addText(title, 3);
+  addText(query, 3);
+  addText(page?.intent, 2.5);
   const headings = (page?.headings ?? '').split(' · ').filter((h) => !siteText?.headings.has(h.trim().toLowerCase()));
   addText(headings.join(' '), 1.5);
   if (!siteText?.descriptions.has((page?.description ?? '').trim().toLowerCase())) addText(page?.description, 2);
@@ -383,7 +410,7 @@ function topicProfile(tab, page, boilerplate) {
   (page?.keywords ?? []).forEach((s, rank) => {
     if (keep(s) && !isIdLike(s)) prominence.set(s, page.keywordCounts?.[rank] ?? Math.max(1, 6 - rank / 5));
   });
-  for (const word of tokenize(tab.title)) {
+  for (const word of tokenize(`${title} ${query} ${page?.intent ?? ''}`)) {
     const s = stem(word);
     if (word.length >= 3 && !STOPWORDS.has(word) && !isIdLike(word) && keep(s)) prominence.set(s, (prominence.get(s) ?? 0) + 3);
   }
@@ -431,6 +458,12 @@ function cosine(a, b) {
   return dot;
 }
 
+function sharedTerms(a, b) {
+  let count = 0;
+  for (const s of a.keys()) if (b.has(s)) count++;
+  return count;
+}
+
 function centroid(members) {
   const sum = new Map();
   for (const { vector } of members) for (const [s, v] of vector) sum.set(s, (sum.get(s) ?? 0) + v);
@@ -455,7 +488,9 @@ function topicLabel(members) {
   const [first, second] = ranked;
   // A second word only when it is just as central to the members, so a label never reads like a
   // sub-topic of one page ("Guitar", not "Guitar chord").
-  const words = second && (first.key ? second.key : second.w >= 0.6 * first.w) ? [first, second] : [first];
+  const most = Math.ceil(members.length * 0.75);
+  const central = (s) => sharedBy(s, 'vector') >= most && (!first.key || sharedBy(s, 'keyTerms') >= most);
+  const words = second && central(second.s) && (first.key ? second.key : second.w >= 0.6 * first.w) ? [first, second] : [first];
   const label = words.map(({ s }) => members.find((m) => m.surface.has(s))?.surface.get(s) ?? s).join(' ');
   return TOPIC_PREFIX + label.charAt(0).toUpperCase() + label.slice(1);
 }
@@ -479,7 +514,9 @@ function cosineWithout(a, b, drop) {
  */
 function assignTopics(candidates, registry, isRare) {
   const related = (a, b) => {
-    if (cosine(a.vector, b.vector) >= TOPIC_JOIN) return true;
+    // A single shared word is not enough on its own: before a page loads its profile can be just
+    // a few title words, and "beginner" alone does not make two pages one topic.
+    if (cosine(a.vector, b.vector) >= TOPIC_JOIN && sharedTerms(a.vector, b.vector) >= 2) return true;
     const shared = new Set([...a.keyTerms].filter((s) => b.keyTerms.has(s) && isRare(s)));
     return shared.size > 0 && cosineWithout(a.weights, b.weights, shared) >= KEY_TERM_CONTEXT;
   };
@@ -494,9 +531,25 @@ function assignTopics(candidates, registry, isRare) {
   for (const [key, topic] of topics) {
     topic.members = topic.members.filter((m) => {
       const others = topic.members.filter((o) => o !== m);
-      return others.length > 0 && (cosine(m.vector, centroid(others)) >= TOPIC_STAY || others.some((o) => related(m, o)));
+      if (!others.length) return false;
+      const rest = centroid(others);
+      return (cosine(m.vector, rest) >= TOPIC_STAY && sharedTerms(m.vector, rest) >= 2) || others.some((o) => related(m, o));
     });
     if (topic.members.length < MIN_GROUP_SIZE) topics.delete(key);
+  }
+  // Topics formed from half-loaded pages ("Strings", "Beginners") merge once the pages show they
+  // are one subject: most pairs across the two are related. The larger topic keeps its group.
+  const ordered = [...topics].sort((a, b) => b[1].members.length - a[1].members.length);
+  for (const [i, [bigKey, big]] of ordered.entries()) {
+    for (const [key, small] of ordered.slice(i + 1)) {
+      if (!topics.has(bigKey) || !topics.has(key)) continue;
+      const pairs = small.members.flatMap((a) => big.members.map((b) => related(a, b)));
+      if (2 * pairs.filter(Boolean).length > pairs.length) {
+        big.members.push(...small.members);
+        small.members = [];
+        topics.delete(key);
+      }
+    }
   }
   const inTopic = (c) => [...topics.values()].some((t) => t.members.includes(c));
 
@@ -505,8 +558,9 @@ function assignTopics(candidates, registry, isRare) {
     let best = null;
     let bestScore = -1;
     for (const topic of topics.values()) {
-      const similarity = cosine(c.vector, centroid(topic.members));
-      const fits = similarity >= TOPIC_JOIN || 2 * topic.members.filter((m) => related(c, m)).length >= topic.members.length;
+      const center = centroid(topic.members);
+      const similarity = cosine(c.vector, center);
+      const fits = (similarity >= TOPIC_JOIN && sharedTerms(c.vector, center) >= 2) || 2 * topic.members.filter((m) => related(c, m)).length >= topic.members.length;
       if (fits && similarity > bestScore) [best, bestScore] = [topic, similarity];
     }
     best?.members.push(c);
@@ -529,8 +583,13 @@ function assignTopics(candidates, registry, isRare) {
     topics.set(key, topic);
   }
 
+  // Labels follow the members: a topic formed from half-loaded pages gets a better name once
+  // their content is in. The key stays, so the group itself is kept.
   const assignment = new Map(); // tabId -> { key, title }
-  for (const [key, { title, members }] of topics) for (const m of members) assignment.set(m.tab.id, { key, title });
+  for (const [key, topic] of topics) {
+    const title = topicLabel(topic.members) ?? topic.title;
+    for (const m of topic.members) assignment.set(m.tab.id, { key, title });
+  }
   return assignment;
 }
 
@@ -582,14 +641,15 @@ async function regroupWindow(windowId, changed) {
 
   // Step 0: topics, by page content. These take priority over site groups.
   const pagesByUrl = new Map(corpus.map((page) => [page.url, page]));
-  const boilerplate = siteBoilerplate(corpus);
+  const boilerplate = siteBoilerplate(corpus, tabs);
   const candidates = eligible.map((tab) => ({
     tab,
     ...topicProfile(tab, pagesByUrl.get(normalizeUrl(tabUrl(tab))), boilerplate),
   }));
   const { df, n } = vectorize(candidates, corpus);
-  // A key term only links pages if it is not on a large share of everything the user reads.
-  const isRare = (s) => n < 10 || (df.get(s) ?? 0) / n <= 0.3;
+  // A key term only links pages if it is not on most of everything the user reads. The bar is
+  // high on purpose: while researching a subject, its word is on many of the user's pages.
+  const isRare = (s) => n < 20 || (df.get(s) ?? 0) / n <= 0.5;
   const topicOf = assignTopics(candidates, registry, isRare);
   for (const tab of eligible) {
     const topic = topicOf.get(tab.id);
@@ -646,8 +706,15 @@ async function regroupWindow(windowId, changed) {
 
   // Step 4: apply the placement through the native tab groups API.
   const created = {};
+  const renamed = {};
   for (const [key, { title, tabs: members }] of placement) {
     const existingId = groupByKey.get(key);
+    // A topic's label is refreshed as its pages fill in, unless the user renamed the group.
+    const live = liveGroups.find((group) => group.id === existingId);
+    if (key.startsWith('topic:') && live && live.title !== title && live.title === registry[existingId]?.title) {
+      await chrome.tabGroups.update(existingId, { title });
+      renamed[existingId] = title;
+    }
     const tabIds = members.filter((tab) => tab.groupId !== existingId).map((tab) => tab.id);
     if (!tabIds.length) continue;
     const groupId = await withRetry(() =>
@@ -656,7 +723,8 @@ async function regroupWindow(windowId, changed) {
       ),
     );
     if (existingId === undefined) {
-      // Title and color are set only at creation, so a user's rename or recolor is kept.
+      // Color is set only at creation and titles change only while unrenamed, so a user's rename
+      // or recolor is kept.
       await chrome.tabGroups.update(groupId, { title, color: colorFor(key), collapsed: false });
       groupByKey.set(key, groupId);
       autoIds.add(groupId);
@@ -677,6 +745,7 @@ async function regroupWindow(windowId, changed) {
   // Step 6: refresh tab counts and the "overloaded" flag of every auto group in this window.
   await mutateStorage(chrome.storage.local, KEYS.AUTO_GROUPS, (reg) => {
     Object.assign(reg, created);
+    for (const [groupId, title] of Object.entries(renamed)) if (reg[groupId]) reg[groupId].title = title;
     for (const groupId of autoIds) {
       if (!reg[groupId]) continue;
       const tabCount = counts.get(groupId) ?? 0;
@@ -775,9 +844,18 @@ function readPage() {
     document.querySelector(`meta[name="${name}" i], meta[property="${name}" i]`)?.getAttribute('content') ?? '';
   const headings = [...document.querySelectorAll('h1, h2, h3')].map((h) => clean(h.textContent)).filter(Boolean);
   const root = document.querySelector('main, article, [role="main"]') ?? document.body;
+  // What the user searched or asked: the site's search box, and messages they sent on AI chat sites
+  // (ChatGPT, Claude, Gemini). Sent messages only; nothing is read while being typed in a chat box.
+  const searchBox = document.querySelector(
+    'input[type="search"], input[role="searchbox"], input[role="combobox"][name], input[name="q"], input[name="query"], input[name="search_query"], input[name="search"]',
+  );
+  const asked = [...document.querySelectorAll('[data-message-author-role="user"], [data-testid="user-message"], user-query')]
+    .map((el) => clean(el.innerText))
+    .filter(Boolean);
   return {
     description: clean(meta('description') || meta('og:description')).slice(0, 400),
     headings: [...new Set(headings)].slice(0, 15).join(' · ').slice(0, 600),
+    intent: [clean(searchBox?.value), ...asked.slice(0, 10)].filter(Boolean).join(' · ').slice(0, 1000),
     text: clean(root?.innerText).slice(0, 30000),
   };
 }
@@ -793,17 +871,19 @@ async function indexTab(tabId) {
   if (tab.incognito || tab.status !== 'complete' || !getRootDomain(url)) return;
   if ((await chrome.storage.local.get(KEYS.MEMORY_PAUSED))[KEYS.MEMORY_PAUSED]) return;
 
-  let page = { description: '', headings: '', text: '' };
+  let page = { description: '', headings: '', intent: '', text: '' };
   try {
     const [injection] = await chrome.scripting.executeScript({ target: { tabId }, func: readPage });
     page = injection?.result;
+    // The watcher asks for a fresh read whenever the page's content changes and settles.
+    if (page) await chrome.scripting.executeScript({ target: { tabId }, files: ['watch.js'] });
   } catch {
     // Pages Chrome does not let extensions read (Web Store, error pages): keep the title and URL.
   }
   if (!page) return; // sensitive page: not remembered at all
 
   const counts = new Map();
-  for (const s of contentStems(`${tab.title} ${page.headings} ${page.description} ${page.text}`)) {
+  for (const s of contentStems(`${tab.title} ${page.intent} ${page.headings} ${page.description} ${page.text}`)) {
     counts.set(s, (counts.get(s) ?? 0) + 1);
   }
   await pageMemory.remember({
@@ -813,6 +893,7 @@ async function indexTab(tabId) {
     favIconUrl: /^https?:/.test(tab.favIconUrl ?? '') ? tab.favIconUrl : '',
     description: page.description,
     headings: page.headings,
+    intent: page.intent,
     ...(() => {
       const top = [...counts].sort((a, b) => b[1] - a[1]).slice(0, KEYWORDS_PER_PAGE);
       return { keywords: top.map(([s]) => s), keywordCounts: top.map(([, n]) => n) };
@@ -821,6 +902,11 @@ async function indexTab(tabId) {
   });
   scheduleRegroup(tab.windowId, tabId); // new content may reveal a cross-site topic
 }
+
+// From watch.js: the page's content changed and has settled (results loaded, a chat answer finished).
+chrome.runtime.onMessage.addListener((message, sender) => {
+  if (message?.type === 'page-settled' && sender.tab?.id !== undefined) scheduleIndex(sender.tab.id);
+});
 
 chrome.runtime.onInstalled.addListener(reconcile);
 chrome.runtime.onStartup.addListener(reconcile);

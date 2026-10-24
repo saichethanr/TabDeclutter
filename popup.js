@@ -9,6 +9,7 @@ import {
   isStale,
   normalizeUrl,
   pageMemory,
+  searchQueryFromUrl,
   stem,
   tabUrl,
   tokenize,
@@ -486,10 +487,13 @@ function buildDoc({ kind, title, url, favIconUrl, page, tab = null, groupTitle =
     host,
     hostPath: host.replace(/^www\./, '') + path,
     groupStems: new Set(contentStems(groupTitle)),
-    summaryStems: new Set(contentStems(`${page?.description ?? ''} ${page?.headings ?? ''}`)),
+    summaryStems: new Set(
+      contentStems(`${page?.description ?? ''} ${page?.headings ?? ''} ${page?.intent ?? ''} ${searchQueryFromUrl(url)}`),
+    ),
     keywordStems: new Set(page?.keywords ?? []),
     snippet:
       page?.description ||
+      page?.intent ||
       (page?.headings ?? '')
         .split(' · ')
         .filter((heading) => !shownTitle.toLowerCase().includes(heading.toLowerCase()))
