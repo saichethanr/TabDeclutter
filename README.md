@@ -12,9 +12,10 @@ A Manifest V3 Chrome extension that fights tab hoarding without sending a single
 
 ## Install
 
-1. Open `chrome://extensions` and turn on **Developer mode**.
-2. Click **Load unpacked** and select this folder (the one containing `manifest.json`).
-3. Pin TabDeclutter. Open it with the toolbar icon or `Ctrl+Shift+K` (`⌘⇧K` on macOS).
+1. Download `TabDeclutter.zip` from the [latest release](https://github.com/saichethanr/TabDeclutter/releases/latest) and extract it (**Extract All** on Windows).
+2. Open `chrome://extensions` and turn on **Developer mode**.
+3. Click **Load unpacked** and select the extracted folder (the one containing `manifest.json`).
+4. Pin TabDeclutter. Open it with the toolbar icon or `Ctrl+Shift+K` (`⌘⇧K` on macOS).
 
 Requires Chrome 102 or later.
 
