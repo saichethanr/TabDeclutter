@@ -13,8 +13,8 @@ Everything runs inside your browser. No account, no servers, no data leaves your
 ## What it does
 
 - **Groups your tabs automatically.**
-  - Tabs about the same topic on different websites are grouped together, for example a tutorial, a blog post, and a forum question about the same thing all go into `🔍 Rust async`.
-  - Other tabs are grouped by website (`GitHub`, `Python`, `YouTube`, …). Busy sites like YouTube, Google, and Stack Overflow get smaller groups by subject, such as `YouTube · lofi`.
+  - Tabs are grouped by **what the pages are about**, first and foremost. A tutorial, a blog post, and a forum question about the same thing go into `🔍 Rust async`. Two ChatGPT chats, one asking "is Claude Code the best?" and one asking "who created Claude Code?", go into `🔍 Claude code`.
+  - Tabs that share no topic are grouped by website (`GitHub`, `Python`, …). Sites full of unrelated content (YouTube, Google, Stack Overflow, ChatGPT, Claude, Perplexity) get groups by subject such as `YouTube · lofi`, and their leftover tabs share one site group.
 - **Finds any page by what you remember.** Type a few words, like "rust article about pinning", "that piano video", or "bread starter recipe". It searches your open tabs and pages you closed earlier, including the words inside the pages, not just their titles.
 - **Reminds you about forgotten tabs.** A tab you have not looked at for 2+ hours counts as "stale". The toolbar icon shows how many you have, and you get a gentle reminder now and then.
 - **Closes tabs safely.** "Archive & Safe Close" saves the page title and link to a history list before closing it, so you can always reopen it later.
@@ -160,7 +160,7 @@ Go to `chrome://extensions` and click **Remove** on the TabDeclutter card. This 
 | `styles.css` | All styles; no remote assets, so it works under the strict extension CSP. |
 
 How it decides:
-- **Topics**: each tab gets a TF-IDF word profile from its title, headings, description, URL, and frequent page words. Tabs from at least two different sites with similar profiles form a topic group. Only tabs that are ungrouped, just navigated, or sit in a topic or general catch-all group are re-evaluated, and a group left with one tab dissolves.
+- **Topics**: each tab gets a TF-IDF word profile from its title, headings, description, URL, and frequent page words. Text a site repeats on many pages (shared descriptions, navigation headings, interface words) is ignored. Tabs with similar profiles form a topic group, on the same site or across sites, and topics take priority over site groups. Pages are re-read when their title changes and when you switch away from them, so chat answers that stream in are captured. Only tabs that are ungrouped, just navigated, or sit in a topic or general catch-all group are re-evaluated, and a group left with one tab dissolves.
 - **Stale**: the last time each tab was in the foreground is tracked in `chrome.storage.local`; a background tab is stale after 2 hours.
 - **Search**: scores title, site, URL, and remembered page words, with light word-stemming, typo tolerance, site-type words (video, spreadsheet, email, …), and extra weight for GitHub on code-related queries.
 

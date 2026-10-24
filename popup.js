@@ -27,6 +27,7 @@ const QUERY_STOPWORDS = new Set([
 ]);
 // Intent weighting: these signal code-hosting work, so github.com tabs rank higher.
 const CODE_INTENT = /\b(prs?|pull[\s-]*requests?|code|issues?)\b/;
+const INTENT_WORDS = new Set(['pr', 'prs', 'pull', 'request', 'requests', 'code', 'issue', 'issues']);
 // Extra spellings matched literally against titles and URLs (GitHub PR URLs contain "/pull/").
 const SYNONYMS = { pr: ['pull'], prs: ['pull', 'pulls'], issue: ['issues'], issues: ['issue'] };
 
@@ -143,7 +144,19 @@ async function loadEcosystem() {
 
 /** Open tabs plus every remembered or archived page that is no longer open. */
 function buildSearchIndex() {
-  const pagesByUrl = new Map(state.pages.map((page) => [page.url, page]));
+  // A description a site repeats on several pages (every ChatGPT chat has the same one) describes
+  // the site, not the page, so it is neither matched nor shown as a preview.
+  const descriptionKey = (page) => `${page.host}\n${page.description}`;
+  const descriptionCounts = new Map();
+  for (const page of state.pages) {
+    if (page.description) descriptionCounts.set(descriptionKey(page), (descriptionCounts.get(descriptionKey(page)) ?? 0) + 1);
+  }
+  const pagesByUrl = new Map(
+    state.pages.map((page) => [
+      page.url,
+      descriptionCounts.get(descriptionKey(page)) > 1 ? { ...page, description: '' } : page,
+    ]),
+  );
   const openUrls = new Set();
   state.openDocs = state.tabs.map((tab) => {
     const url = tabUrl(tab);
@@ -161,7 +174,7 @@ function buildSearchIndex() {
   });
   const archivedAt = new Map(state.archive.map((entry) => [normalizeUrl(entry.url), entry]));
   const closed = new Map();
-  for (const page of state.pages) {
+  for (const page of pagesByUrl.values()) {
     if (openUrls.has(page.url)) continue;
     const archived = archivedAt.get(page.url);
     closed.set(page.url, { page, title: page.title, url: page.url, favIconUrl: page.favIconUrl, when: archived?.closedAt ?? page.lastVisited, archived: Boolean(archived) });
@@ -427,10 +440,22 @@ function renderHistory() {
 // Command bar search engine
 // ---------------------------------------------------------------------------------------------
 
-function parseQuery(raw) {
+/**
+ * Splits the query into terms. Adjacent terms that appear together in a page title are a name
+ * ("claude code"), so they are matched literally and do not trigger intent weighting or site
+ * types ("code" would otherwise favor GitHub).
+ */
+function parseQuery(raw, docs) {
   const phrase = raw.trim().toLowerCase();
   const terms = [...new Set(tokenize(phrase).filter((t) => !QUERY_STOPWORDS.has(t) && !STOPWORDS.has(t)))];
-  return { terms, codeIntent: CODE_INTENT.test(phrase) };
+  const names = new Set();
+  for (let i = 0; i + 1 < terms.length; i++) {
+    if (INTENT_WORDS.has(terms[i]) && INTENT_WORDS.has(terms[i + 1])) continue; // "pull request" stays an intent
+    const pair = `${terms[i]} ${terms[i + 1]}`;
+    if (docs.some((doc) => doc.titleLower.includes(pair))) names.add(terms[i]).add(terms[i + 1]);
+  }
+  const codeIntent = CODE_INTENT.test(phrase) && terms.some((t) => INTENT_WORDS.has(t) && !names.has(t));
+  return { terms, names, codeIntent };
 }
 
 /** Precomputes everything search needs about one open tab or remembered page. */
@@ -499,7 +524,7 @@ function withinEdits(a, b, max) {
  * Points for one query term. Title hits beat site hits beat page-content hits; a term that
  * describes the kind of site ("video", "spreadsheet") scores when the page is on such a site.
  */
-function termScore(term, doc) {
+function termScore(term, doc, isName) {
   const s = stem(term);
   let points = 0;
   for (const variant of [term, ...(SYNONYMS[term] ?? [])]) {
@@ -511,14 +536,14 @@ function termScore(term, doc) {
     else if (variant.length >= 3 && doc.urlLower.includes(variant)) points = Math.max(points, 3);
   }
   if (doc.groupStems.has(s)) points = Math.max(points, 6);
-  if (!points && term.length >= 4) {
+  if (!points && term.length >= 5) {
     const max = term.length >= 8 ? 2 : 1;
-    if (doc.titleWords.some((w) => w.length >= 4 && withinEdits(term, w, max))) points = 6;
+    if (doc.titleWords.some((w) => w.length >= 5 && withinEdits(term, w, max))) points = 6;
   }
   const inContent = doc.summaryStems.has(s) || doc.keywordStems.has(s);
   if (doc.summaryStems.has(s)) points = Math.max(points, 6);
   else if (doc.keywordStems.has(s)) points = Math.max(points, 4);
-  const sites = CONCEPT_SITES.get(term) ?? CONCEPT_SITES.get(s);
+  const sites = isName ? null : CONCEPT_SITES.get(term) ?? CONCEPT_SITES.get(s);
   if (sites?.some((site) => siteMatches(doc, site))) points = Math.max(points, 9);
   return { points, inContent };
 }
@@ -528,7 +553,7 @@ function scoreDoc(doc, query) {
   let matched = 0;
   let contentHit = false;
   for (const term of query.terms) {
-    const { points, inContent } = termScore(term, doc);
+    const { points, inContent } = termScore(term, doc, query.names.has(term));
     if (points) {
       score += points;
       matched++;
@@ -617,7 +642,7 @@ function runSearch() {
     els.search.setAttribute('aria-expanded', 'false');
     return;
   }
-  const query = parseQuery(raw);
+  const query = parseQuery(raw, [...state.openDocs, ...state.closedDocs]);
   const open = query.terms.length ? rank(state.openDocs, query, { limit: MAX_OPEN_RESULTS, minCoverage: 0 }) : [];
   // The memory holds thousands of pages, so closed pages must match at least half of the query.
   const closed = query.terms.length ? rank(state.closedDocs, query, { limit: MAX_CLOSED_RESULTS, minCoverage: 0.5 }) : [];

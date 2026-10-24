@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "TabDeclutter",
   "short_name": "TabDeclutter",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "A local-first assistant against tab hoarding: groups tabs by topic and site, nudges about stale ones, and finds open or closed pages by what they were about.",
   "minimum_chrome_version": "102",
   "permissions": ["tabs", "tabGroups", "storage", "notifications", "scripting"],

@@ -28,13 +28,18 @@ const NUDGE_MIN_STALE = 5;
 const NOTIFICATION_ID = 'tabdeclutter-nudge';
 const GROUP_COLORS = ['blue', 'cyan', 'green', 'purple', 'pink', 'orange', 'yellow', 'red', 'grey'];
 
-// Rule 2: domains that host unrelated content. They are split into keyword sub-groups instead of
-// one domain-wide group.
-const CATCH_ALL_DOMAINS = new Set(['google.com', 'youtube.com', 'stackoverflow.com']);
+// Rule 2: domains that host unrelated content (search, video, Q&A, AI chat). Their tabs are never
+// grouped just for sharing the site: they go to topic groups by content, keyword sub-groups by
+// title, and only then to a general group for the site.
+const CATCH_ALL_DOMAINS = new Set([
+  'google.com', 'youtube.com', 'stackoverflow.com', 'chatgpt.com', 'openai.com', 'claude.ai', 'perplexity.ai',
+]);
 const TITLE_NOISE = {
   'google.com': ['google', 'search'],
   'youtube.com': ['youtube'],
   'stackoverflow.com': ['stack', 'overflow', 'stackoverflow'],
+  'chatgpt.com': ['chatgpt'],
+  'openai.com': ['chatgpt', 'openai'],
 };
 const TITLE_STOPWORDS = new Set([
   ...STOPWORDS,
@@ -92,6 +97,8 @@ chrome.tabs.onActivated.addListener(async ({ tabId, windowId }) => {
     return prev;
   });
   await stamp([tabId, previous]);
+  // The tab the user just left is now in its settled state (e.g. a finished chat answer): re-read it.
+  if (previous !== undefined && previous !== tabId) scheduleIndex(previous);
   scheduleHealthCheck();
 });
 
@@ -117,8 +124,9 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   const navigated = changeInfo.url || changeInfo.status === 'complete';
   const retitled = changeInfo.title && CATCH_ALL_DOMAINS.has(getRootDomain(tabUrl(tab)));
   if (navigated || retitled) scheduleRegroup(tab.windowId, tabId);
-  // Single-page apps change the title after the URL, so a pending read is pushed back on title changes.
-  if (navigated || (changeInfo.title && indexTimers.has(tabId))) scheduleIndex(tabId);
+  // Pages that fill in after loading (chat answers, single-page apps) usually retitle themselves,
+  // so a title change triggers a fresh read.
+  if (navigated || changeInfo.title) scheduleIndex(tabId);
 });
 
 chrome.tabs.onRemoved.addListener((tabId, { windowId, isWindowClosing }) => {
@@ -265,9 +273,10 @@ async function withRetry(operation, attempts = 3) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Topic engine: tabs on different sites about the same subject ("researching rust async" across a
-// blog, the docs, and Stack Overflow) are grouped by comparing TF-IDF word profiles built locally
-// from each tab's title, URL, and remembered page content.
+// Topic engine: tabs about the same subject are grouped by what their pages say, whether they are
+// on different sites ("rust async" across a blog, the docs, and Stack Overflow) or on one site (two
+// ChatGPT chats about Claude Code). It compares TF-IDF word profiles built locally from each tab's
+// title, URL, and remembered page content, ignoring text a site repeats on all its pages.
 // ---------------------------------------------------------------------------------------------
 
 const TOPIC_PREFIX = '🔍 ';
@@ -286,8 +295,39 @@ const WEB_NOISE = new Set(
   ].map(stem),
 );
 
+/**
+ * Text a site repeats across its pages says nothing about any one page: a shared meta description
+ * (every ChatGPT chat has the same one), navigation headings, and interface words. Learned per site
+ * from page memory.
+ */
+function siteBoilerplate(corpus) {
+  const sites = new Map(); // domain -> { pages, descriptions, headings, terms }
+  const bump = (map, key) => map.set(key, (map.get(key) ?? 0) + 1);
+  for (const page of corpus) {
+    const domain = getRootDomain(page.url);
+    if (!domain) continue;
+    if (!sites.has(domain)) sites.set(domain, { pages: 0, descriptions: new Map(), headings: new Map(), terms: new Map() });
+    const site = sites.get(domain);
+    site.pages++;
+    if (page.description) bump(site.descriptions, page.description.trim().toLowerCase());
+    for (const heading of new Set((page.headings ?? '').split(' · '))) if (heading) bump(site.headings, heading.trim().toLowerCase());
+    for (const s of new Set(page.keywords ?? [])) bump(site.terms, s);
+  }
+  const boilerplate = new Map();
+  for (const [domain, site] of sites) {
+    const repeated = (map, min) => new Set([...map].filter(([, n]) => n >= min).map(([text]) => text));
+    boilerplate.set(domain, {
+      descriptions: repeated(site.descriptions, 2),
+      headings: repeated(site.headings, 3),
+      // With enough pages, words on most of a site's pages are interface text.
+      terms: site.pages >= 5 ? repeated(site.terms, Math.ceil(site.pages * 0.6)) : new Set(),
+    });
+  }
+  return boilerplate;
+}
+
 /** Weighted term profile of one tab, plus the readable spelling of each stem (for labels). */
-function topicProfile(tab, page) {
+function topicProfile(tab, page, boilerplate) {
   const url = tabUrl(tab);
   const domain = getRootDomain(url);
   let host = '';
@@ -297,7 +337,8 @@ function topicProfile(tab, page) {
   const siteWords = new Set([...tokenize(host), ...tokenize(domainLabel(domain)), ...(TITLE_NOISE[domain] ?? [])].map(stem));
   const weights = new Map();
   const surface = new Map();
-  const keep = (s) => s.length >= 3 && !siteWords.has(s) && !WEB_NOISE.has(s);
+  const siteText = boilerplate.get(domain);
+  const keep = (s) => s.length >= 3 && !siteWords.has(s) && !WEB_NOISE.has(s) && !siteText?.terms.has(s);
   const addText = (text, weight) => {
     for (const word of tokenize(text)) {
       if (word.length < 3 || STOPWORDS.has(word) || /^\d+$/.test(word)) continue;
@@ -308,13 +349,15 @@ function topicProfile(tab, page) {
     }
   };
   addText(tab.title, 3);
-  addText(page?.headings, 2);
-  addText(page?.description, 2);
+  const headings = (page?.headings ?? '').split(' · ').filter((h) => !siteText?.headings.has(h.trim().toLowerCase()));
+  addText(headings.join(' '), 2);
+  if (!siteText?.descriptions.has((page?.description ?? '').trim().toLowerCase())) addText(page?.description, 2);
   try {
     addText(new URL(url).pathname.replace(/[-_/.]+/g, ' '), 1);
   } catch {}
+  // Page words are stored most frequent first; the words a page keeps repeating carry its topic.
   (page?.keywords ?? []).forEach((s, rank) => {
-    if (keep(s)) weights.set(s, (weights.get(s) ?? 0) + 1.5 * (1 - rank / 300));
+    if (keep(s)) weights.set(s, (weights.get(s) ?? 0) + 2 / (1 + rank / 8));
   });
   return { weights, surface };
 }
@@ -359,8 +402,6 @@ function centroid(members) {
   return sum;
 }
 
-const distinctDomains = (members) => new Set(members.map((m) => m.domain)).size;
-
 /** Up to two words most shared across the members, e.g. "🔍 Rust async". */
 function topicLabel(members) {
   const shared = new Map();
@@ -376,9 +417,8 @@ function topicLabel(members) {
 }
 
 /**
- * Assigns cross-site topic groups. Existing topic members stay while they still fit; other tabs
- * join the closest existing topic; the rest form new topics around the best-connected tab, which
- * must gather at least two tabs from at least two different sites.
+ * Assigns topic groups. Existing topic members stay while they still fit; other tabs join the
+ * closest existing topic; the rest form new topics around the best-connected tab.
  */
 function assignTopics(candidates, registry) {
   const assignment = new Map(); // tabId -> { key, title }
@@ -394,7 +434,7 @@ function assignTopics(candidates, registry) {
     topic.members = topic.members.filter(
       (m) => topic.members.length > 1 && cosine(m.vector, centroid(topic.members.filter((o) => o !== m))) >= TOPIC_STAY,
     );
-    if (topic.members.length < MIN_GROUP_SIZE || distinctDomains(topic.members) < 2) topics.delete(key);
+    if (topic.members.length < MIN_GROUP_SIZE) topics.delete(key);
   }
 
   for (const c of candidates) {
@@ -415,7 +455,7 @@ function assignTopics(candidates, registry) {
   for (const i of order) {
     if (used.has(rest[i])) continue;
     const members = [rest[i], ...neighbors[i].filter((d) => !used.has(d))];
-    if (members.length < MIN_GROUP_SIZE || distinctDomains(members) < 2) continue;
+    if (members.length < MIN_GROUP_SIZE) continue;
     const title = topicLabel(members);
     if (!title) continue;
     members.forEach((m) => used.add(m));
@@ -475,12 +515,12 @@ async function regroupWindow(windowId, changed) {
     placement.get(key).tabs.push(tab);
   };
 
-  // Step 0: cross-site topics.
+  // Step 0: topics, by page content. These take priority over site groups.
   const pagesByUrl = new Map(corpus.map((page) => [page.url, page]));
+  const boilerplate = siteBoilerplate(corpus);
   const candidates = eligible.map((tab) => ({
     tab,
-    domain: getRootDomain(tabUrl(tab)),
-    ...topicProfile(tab, pagesByUrl.get(normalizeUrl(tabUrl(tab)))),
+    ...topicProfile(tab, pagesByUrl.get(normalizeUrl(tabUrl(tab))), boilerplate),
   }));
   vectorize(candidates, corpus);
   const topicOf = assignTopics(candidates, registry);
