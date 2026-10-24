@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>TabDeclutter</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main class="app">
+      <header class="app-header">
+        <img class="app-logo" src="icons/icon48.png" alt="" width="24" height="24" />
+        <h1 class="app-title">TabDeclutter</h1>
+        <span class="app-tag" title="Everything runs locally in your browser">100% local</span>
+      </header>
+
+      <section class="command" aria-label="Find a tab">
+        <div class="command-bar">
+          <svg class="command-icon" viewBox="0 0 24 24" aria-hidden="true">
+            <circle cx="11" cy="11" r="7" />
+            <path d="m20 20-3.5-3.5" />
+          </svg>
+          <input
+            id="search"
+            class="command-input"
+            type="search"
+            role="combobox"
+            aria-label="Search open tabs"
+            aria-controls="results"
+            aria-expanded="false"
+            aria-autocomplete="list"
+            autocomplete="off"
+            spellcheck="false"
+            placeholder="Where is my PR tab for Mythos vulnerability?..."
+            autofocus
+          />
+        </div>
+        <ul id="results" class="results" role="listbox" aria-label="Matching tabs" hidden></ul>
+        <p id="results-empty" class="results-empty" hidden>No open tab matches that. Try fewer words.</p>
+      </section>
+
+      <div id="dashboard" class="dashboard">
+        <section class="stats" aria-label="Tab statistics">
+          <div class="stat">
+            <span id="stat-total" class="stat-value">–</span>
+            <span class="stat-label">total tabs open</span>
+          </div>
+          <div class="stat">
+            <span id="stat-groups" class="stat-value">–</span>
+            <span class="stat-label">active groups</span>
+          </div>
+          <div id="stat-stale-card" class="stat">
+            <span id="stat-stale" class="stat-value">–</span>
+            <span class="stat-label">stale tabs eating RAM</span>
+          </div>
+        </section>
+
+        <section class="panel" aria-labelledby="cleanups-title">
+          <div class="panel-header">
+            <h2 id="cleanups-title" class="panel-title">Actionable Cleanups</h2>
+            <button id="archive-all" class="btn btn-ghost" type="button" hidden>Archive all stale</button>
+          </div>
+          <div id="cleanups" class="cleanups"></div>
+          <div id="cleanups-empty" class="empty" hidden>
+            <span class="empty-mark" aria-hidden="true">✓</span>
+            <span>All clear. No stale tabs or overloaded groups right now.</span>
+          </div>
+        </section>
+
+        <details id="history" class="history">
+          <summary class="history-summary">Recently archived (<span id="history-count">0</span>)</summary>
+          <ul id="history-list" class="history-list"></ul>
+        </details>
+      </div>
+
+      <p id="toast" class="toast" role="status" aria-live="polite" hidden></p>
+    </main>
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>
