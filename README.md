@@ -4,10 +4,10 @@
 
 Everything runs inside your browser. No account, no servers, no data leaves your computer.
 
-<p align="center">
-  <img src="docs/dashboard.png" alt="TabDeclutter dashboard" width="280">
-  <img src="docs/search-open-tabs.png" alt="Searching open tabs" width="280">
-  <img src="docs/search-closed-pages.png" alt="Finding a page closed earlier" width="280">
+<p align="center" valign="top">
+  <img src="docs/dashboard.png" alt="TabDeclutter dashboard" width="250">
+  <img src="docs/search-open-tabs.png" alt="Searching open tabs" width="250">
+  <img src="docs/search-closed-pages.png" alt="Finding a page closed earlier" width="250">
 </p>
 
 ## What it does
