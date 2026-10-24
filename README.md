@@ -21,19 +21,56 @@ Everything runs inside your browser. No account, no servers, no data leaves your
 
 ## Install (about 2 minutes)
 
-TabDeclutter is not on the Chrome Web Store yet, so it is installed from a download. Works in Google Chrome, Microsoft Edge, Brave, and other Chromium browsers (version 102 or newer).
+TabDeclutter is not on the Chrome Web Store yet, so you install it from a download. It works in Google Chrome, Microsoft Edge, Brave, and other Chromium browsers (version 102 or newer).
 
-1. **Download** `TabDeclutter.zip` from the [latest release](https://github.com/saichethanr/TabDeclutter/releases/latest) (under **Assets**).
-2. **Unzip it.** On Windows, right-click the file → **Extract All…** → **Extract**. On a Mac, double-click it.
-   Open the new folder and check that you can see `manifest.json` directly inside it. That is the folder you will select in step 5.
-3. **Open the extensions page.** Type `chrome://extensions` into the address bar and press Enter. (In Edge: `edge://extensions`.)
-4. **Turn on Developer mode** with the switch in the top-right corner (bottom-left in Edge).
-5. **Click "Load unpacked"** and select the folder from step 2.
-6. **Pin it to the toolbar.** Click the puzzle-piece icon next to the address bar, then the pin next to **TabDeclutter**.
+### Step 1: Download the zip
 
-Keep the unzipped folder where it is (for example in Documents). Chrome loads the extension from it, so deleting or moving the folder removes the extension.
+Open the [latest release](https://github.com/saichethanr/TabDeclutter/releases/latest), scroll to **Assets**, and click **TabDeclutter.zip**. (Not "Source code".)
 
-When it loads, TabDeclutter starts grouping the tabs you already have open within a few seconds.
+<img src="docs/install-download.png" alt="The TabDeclutter.zip download under Assets on the release page" width="720">
+
+### Step 2: Unzip it
+
+- **Windows:** open your Downloads folder, right-click `TabDeclutter.zip` → **Extract All…** → **Extract**.
+- **Mac:** double-click `TabDeclutter.zip`.
+
+Open the new `TabDeclutter` folder and make sure you can see `manifest.json` **directly inside it**. If you see another `TabDeclutter` folder instead, open that one; it is the folder you need in Step 4.
+
+Move this folder somewhere permanent, such as Documents. Chrome runs the extension from this folder, so don't delete it later.
+
+### Step 3: Open the extensions page and turn on Developer mode
+
+1. Type (or paste) `chrome://extensions` into the address bar and press **Enter**. (In Edge, use `edge://extensions`.)
+2. Turn on the **Developer mode** switch in the top-right corner, marked **1** below. (In Edge, it is on the left side.)
+
+New buttons appear at the top of the page.
+
+<img src="docs/install-extensions-page.png" alt="chrome://extensions with the Developer mode switch (1) and the Load unpacked button (2)" width="720">
+
+### Step 4: Load the folder
+
+1. Click **Load unpacked**, marked **2** above.
+2. In the window that opens, go to the `TabDeclutter` folder from Step 2 (the one with `manifest.json` inside), select it, and click **Select Folder**.
+
+You don't need to pick any single file. Selecting the folder is enough.
+
+### Step 5: Check that it worked
+
+A **TabDeclutter** card now appears on the extensions page:
+
+<img src="docs/install-done.png" alt="The TabDeclutter card on chrome://extensions" width="420">
+
+- **A**: the name and version (for example **1.1.0**).
+- **B**: the reload button. Use it after you update to a new version.
+- **C**: the on/off switch. Keep it **on** (blue).
+
+If Chrome shows "Manifest file is missing or unreadable" instead, you picked the outer folder. Click **Load unpacked** again and choose the folder that has `manifest.json` directly inside it.
+
+### Step 6: Pin it to the toolbar
+
+Click the puzzle-piece icon to the right of the address bar, then click the pin next to **TabDeclutter**. Its icon now stays in your toolbar.
+
+That's it. Within a few seconds TabDeclutter starts grouping the tabs you already have open.
 
 ## How to use it
 
@@ -85,7 +122,7 @@ The line at the bottom of the popup shows how many pages TabDeclutter remembers.
 
 1. Download the new `TabDeclutter.zip` from the [latest release](https://github.com/saichethanr/TabDeclutter/releases/latest) and unzip it.
 2. Copy its files into your existing TabDeclutter folder and choose **Replace** when asked.
-3. Go to `chrome://extensions` and click the **↻** (reload) icon on the TabDeclutter card.
+3. Go to `chrome://extensions` and click the **↻** reload button on the TabDeclutter card (**B** in the Step 5 picture).
 
 Your history and remembered pages are kept.
 
