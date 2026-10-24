@@ -27,7 +27,7 @@ TabDeclutter is not on the Chrome Web Store yet, so you install it from a downlo
 
 Open the [latest release](https://github.com/saichethanr/TabDeclutter/releases/latest), scroll to **Assets**, and click **TabDeclutter.zip**. (Not "Source code".)
 
-<img src="docs/install-download.png" alt="The TabDeclutter.zip download under Assets on the release page" width="720">
+<img src="docs/install-download.png" alt="The TabDeclutter.zip download under Assets on the release page" width="560">
 
 ### Step 2: Unzip it
 
