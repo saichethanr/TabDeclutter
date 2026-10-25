@@ -28,10 +28,23 @@ const MULTI_PART_SUFFIXES = new Set([
 ]);
 
 /** Returns the registrable root domain of an http(s) URL ("gist.github.com" -> "github.com"), or null. */
+// Browser pages that are just an empty start point, never grouped.
+const NEW_TAB_PAGES = new Set(['newtab', 'new-tab-page', 'startpageshared', 'start']);
+
+/**
+ * The "site" a URL belongs to: the root domain for web pages ("github.com"), "file:" for local
+ * files, "chrome:" for browser pages (settings, history, …), and "chrome-extension://<id>" for an
+ * extension's pages. Null for new-tab pages and URLs that cannot be grouped.
+ */
 export function getRootDomain(url) {
   let host;
   try {
     const parsed = new URL(url);
+    if (parsed.protocol === 'file:') return 'file:';
+    if (parsed.protocol === 'chrome-extension:') return `chrome-extension://${parsed.hostname}`;
+    if (['chrome:', 'edge:', 'brave:', 'opera:', 'vivaldi:'].includes(parsed.protocol)) {
+      return NEW_TAB_PAGES.has(parsed.hostname) ? null : 'chrome:';
+    }
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
     host = parsed.hostname.toLowerCase().replace(/\.$/, '');
   } catch {
@@ -178,24 +191,32 @@ const requestValue = (request) =>
 
 export const pageMemory = {
   getAll: () => withStore('readonly', (store) => requestValue(store.getAll())),
+  get: (url) => withStore('readonly', (store) => requestValue(store.get(url))),
+  /** The remembered pages for these URLs (undefined where there is none), in one transaction. */
+  getMany: (urls) => withStore('readonly', (store) => Promise.all(urls.map((url) => requestValue(store.get(url))))),
   count: () => withStore('readonly', (store) => requestValue(store.count())),
   clear: () => withStore('readwrite', (store) => store.clear()),
 
-  /** Inserts or refreshes a page, then evicts the least recently visited pages beyond the limit. */
+  /**
+   * Inserts or refreshes a page, then evicts the least recently visited pages beyond the limit.
+   * Resolves with what changed ({ previous, saved, evicted }), so callers can update statistics.
+   */
   remember: (record) =>
     withStore('readwrite', async (store) => {
-      const existing = await requestValue(store.get(record.url));
-      store.put({ ...record, firstSeen: existing?.firstSeen ?? record.lastVisited });
+      const previous = await requestValue(store.get(record.url));
+      const saved = { ...record, firstSeen: previous?.firstSeen ?? record.lastVisited };
+      store.put(saved);
+      const evicted = [];
       const excess = (await requestValue(store.count())) - PAGE_MEMORY_LIMIT;
-      if (excess <= 0) return;
-      let removed = 0;
+      if (excess <= 0) return { previous, saved, evicted };
       const cursor = store.index('lastVisited').openCursor();
       cursor.onsuccess = () => {
         const current = cursor.result;
-        if (!current || removed >= excess) return;
+        if (!current || evicted.length >= excess) return;
+        evicted.push(current.value);
         current.delete();
-        removed++;
         current.continue();
       };
+      return { previous, saved, evicted };
     }),
 };

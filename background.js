@@ -127,10 +127,11 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (navigated || retitled) scheduleRegroup(tab.windowId, tabId);
   // Pages that fill in after loading (chat answers, single-page apps) usually retitle themselves,
   // so a title change triggers a fresh read.
-  if (navigated || changeInfo.title) scheduleIndex(tabId);
+  if (navigated || changeInfo.title) scheduleIndex(tabId, { navigated: Boolean(navigated) });
 });
 
 chrome.tabs.onRemoved.addListener((tabId, { windowId, isWindowClosing }) => {
+  lastRead.delete(tabId);
   mutateStorage(chrome.storage.local, KEYS.ACCESS, (map) => {
     delete map[tabId];
   });
@@ -198,6 +199,9 @@ function scheduleRegroup(windowId, tabId) {
 
 function domainLabel(domain) {
   if (DOMAIN_LABELS[domain]) return DOMAIN_LABELS[domain];
+  if (domain === 'file:') return 'Local files';
+  if (domain === 'chrome:') return 'Browser pages';
+  if (domain.startsWith('chrome-extension://')) return 'Extension pages';
   const name = domain.split('.')[0];
   return name.charAt(0).toUpperCase() + name.slice(1);
 }
@@ -306,48 +310,81 @@ const WEB_NOISE = new Set(
   ].map(stem),
 );
 
+// ---------------------------------------------------------------------------------------------
+// Page memory statistics: how many remembered pages use each word, and the text each site repeats.
+// Kept in the service worker and updated as pages are remembered, so a regroup pass reads only the
+// open tabs' pages instead of the whole memory (up to PAGE_MEMORY_LIMIT pages).
+// ---------------------------------------------------------------------------------------------
+
+let corpusStats = null; // Promise<{ n, df, sites }>
+
+function countPage(stats, page, sign) {
+  const bump = (map, key) => {
+    const value = (map.get(key) ?? 0) + sign;
+    if (value > 0) map.set(key, value);
+    else map.delete(key);
+  };
+  stats.n += sign;
+  for (const s of new Set([...(page.keywords ?? []), ...contentStems(page.title)])) bump(stats.df, s);
+  const domain = getRootDomain(page.url);
+  if (!domain) return;
+  let site = stats.sites.get(domain);
+  if (!site) {
+    site = { pages: 0, descriptions: new Map(), headings: new Map(), terms: new Map(), titles: new Map() };
+    stats.sites.set(domain, site);
+  }
+  site.pages += sign;
+  if (page.description) bump(site.descriptions, page.description.trim().toLowerCase());
+  for (const heading of new Set((page.headings ?? '').split(' · '))) if (heading) bump(site.headings, heading.trim().toLowerCase());
+  for (const s of new Set(page.keywords ?? [])) bump(site.terms, s);
+  if (page.title?.trim()) bump(site.titles, page.title.trim().toLowerCase());
+}
+
+/** The statistics, built from page memory once per service worker run (or after a Clear). */
+async function loadCorpusStats() {
+  const count = await pageMemory.count().catch(() => 0);
+  if (corpusStats && (await corpusStats).n === count) return corpusStats;
+  corpusStats = pageMemory
+    .getAll()
+    .catch(() => [])
+    .then((pages) => {
+      const stats = { n: 0, df: new Map(), sites: new Map() };
+      for (const page of pages) countPage(stats, page, 1);
+      return stats;
+    });
+  return corpusStats;
+}
+
 /**
  * Text a site repeats across its pages says nothing about any one page: a shared meta description
- * (every ChatGPT chat has the same one), navigation headings, and interface words. Learned per site
- * from page memory.
+ * (every ChatGPT chat has the same one), a shared title ("ChatGPT", "ShopKart: Online Shopping"),
+ * navigation headings, and interface words. Learned per site from page memory and the open tabs.
  */
-function siteBoilerplate(corpus, tabs) {
-  const sites = new Map(); // domain -> { pages, descriptions, headings, terms }
-  const bump = (map, key) => map.set(key, (map.get(key) ?? 0) + 1);
-  // A title shared by different pages of one site ("ShopKart: Online Shopping", "ChatGPT") names
-  // the site, not the page, so it must not link those pages into a topic.
-  const titleUrls = new Map(); // domain -> title -> Set(url)
-  const addTitle = (url, title) => {
+function siteBoilerplate(stats, tabs, pagesByUrl) {
+  const repeated = (map, min) => new Set([...(map ?? [])].filter(([, n]) => n >= min).map(([text]) => text));
+  // Live titles of open tabs that page memory does not have yet count as pages too.
+  const liveTitles = new Map(); // domain -> Map(title -> number of URLs)
+  const seen = new Set();
+  for (const tab of tabs) {
+    const url = normalizeUrl(tabUrl(tab));
     const domain = getRootDomain(url);
-    if (!domain || !title?.trim()) return;
-    if (!titleUrls.has(domain)) titleUrls.set(domain, new Map());
-    const byTitle = titleUrls.get(domain);
-    const key = title.trim().toLowerCase();
-    if (!byTitle.has(key)) byTitle.set(key, new Set());
-    byTitle.get(key).add(normalizeUrl(url));
-  };
-  for (const page of corpus) addTitle(page.url, page.title);
-  for (const tab of tabs) addTitle(tabUrl(tab), tab.title);
-  for (const page of corpus) {
-    const domain = getRootDomain(page.url);
-    if (!domain) continue;
-    if (!sites.has(domain)) sites.set(domain, { pages: 0, descriptions: new Map(), headings: new Map(), terms: new Map() });
-    const site = sites.get(domain);
-    site.pages++;
-    if (page.description) bump(site.descriptions, page.description.trim().toLowerCase());
-    for (const heading of new Set((page.headings ?? '').split(' · '))) if (heading) bump(site.headings, heading.trim().toLowerCase());
-    for (const s of new Set(page.keywords ?? [])) bump(site.terms, s);
+    const title = tab.title?.trim().toLowerCase();
+    if (!domain || !title || seen.has(`${url} ${title}`) || pagesByUrl.get(url)?.title?.trim().toLowerCase() === title) continue;
+    seen.add(`${url} ${title}`);
+    if (!liveTitles.has(domain)) liveTitles.set(domain, new Map());
+    liveTitles.get(domain).set(title, (liveTitles.get(domain).get(title) ?? 0) + 1);
   }
   const boilerplate = new Map();
-  const repeated = (map, min) => new Set([...(map ?? [])].filter(([, n]) => n >= min).map(([text]) => text));
-  for (const domain of new Set([...sites.keys(), ...titleUrls.keys()])) {
-    const site = sites.get(domain);
+  for (const domain of new Set(tabs.map((tab) => getRootDomain(tabUrl(tab))).filter(Boolean))) {
+    const site = stats.sites.get(domain);
+    const titles = new Map(site?.titles);
+    for (const [title, n] of liveTitles.get(domain) ?? []) titles.set(title, (titles.get(title) ?? 0) + n);
     boilerplate.set(domain, {
       descriptions: repeated(site?.descriptions, 2),
       headings: repeated(site?.headings, 3),
       // With enough pages, words on most of a site's pages are interface text.
       terms: site?.pages >= 5 ? repeated(site.terms, Math.ceil(site.pages * 0.6)) : new Set(),
-      titles: new Set([...(titleUrls.get(domain) ?? [])].filter(([, urls]) => urls.size >= 2).map(([title]) => title)),
+      titles: repeated(titles, 2),
     });
   }
   return boilerplate;
@@ -425,22 +462,18 @@ function topicProfile(tab, page, boilerplate) {
 }
 
 /** Turns raw profiles into unit-length TF-IDF vectors, using page memory as the document corpus. */
-function vectorize(profiles, corpus) {
-  const df = new Map();
-  const count = (terms) => {
-    for (const s of new Set(terms)) df.set(s, (df.get(s) ?? 0) + 1);
-  };
-  const remembered = new Set(corpus.map((page) => page.url));
-  for (const page of corpus) count([...(page.keywords ?? []), ...contentStems(page.title)]);
-  // Open tabs already in page memory are in the corpus; count only the ones that are not.
-  const unseen = profiles.filter((profile) => !remembered.has(profile.url));
-  for (const profile of unseen) count(profile.weights.keys());
-  const n = corpus.length + unseen.length;
+function vectorize(profiles, stats, remembered) {
+  // Open tabs already in page memory are in the statistics; count only the ones that are not.
+  const unseen = new Map();
+  const unseenProfiles = profiles.filter((profile) => !remembered.has(profile.url));
+  for (const profile of unseenProfiles) for (const s of profile.weights.keys()) unseen.set(s, (unseen.get(s) ?? 0) + 1);
+  const n = stats.n + unseenProfiles.length;
+  const df = (s) => (stats.df.get(s) ?? 0) + (unseen.get(s) ?? 0);
   for (const profile of profiles) {
     const vector = new Map();
     let norm = 0;
     for (const [s, weight] of profile.weights) {
-      const value = weight * (Math.log((n + 1) / ((df.get(s) ?? 0) + 1)) + 1);
+      const value = weight * (Math.log((n + 1) / (df(s) + 1)) + 1);
       vector.set(s, value);
       norm += value * value;
     }
@@ -607,12 +640,12 @@ async function regroupWindow(windowId, changed) {
   }
   if (win.type !== 'normal') return; // tab groups exist only in normal windows
 
-  const [tabs, liveGroups, registry, detached, corpus] = await Promise.all([
+  const [tabs, liveGroups, registry, detached, stats] = await Promise.all([
     chrome.tabs.query({ windowId }),
     chrome.tabGroups.query({ windowId }),
     readKey(chrome.storage.local, KEYS.AUTO_GROUPS),
     readKey(chrome.storage.session, 'detachedTabs'),
-    pageMemory.getAll().catch(() => []),
+    loadCorpusStats(),
   ]);
 
   const groupByKey = new Map(); // key -> live auto group id in this window
@@ -640,16 +673,18 @@ async function regroupWindow(windowId, changed) {
   };
 
   // Step 0: topics, by page content. These take priority over site groups.
-  const pagesByUrl = new Map(corpus.map((page) => [page.url, page]));
-  const boilerplate = siteBoilerplate(corpus, tabs);
+  const urls = [...new Set(tabs.map((tab) => normalizeUrl(tabUrl(tab))))];
+  const pages = await pageMemory.getMany(urls).catch(() => []);
+  const pagesByUrl = new Map(pages.filter(Boolean).map((page) => [page.url, page]));
+  const boilerplate = siteBoilerplate(stats, tabs, pagesByUrl);
   const candidates = eligible.map((tab) => ({
     tab,
     ...topicProfile(tab, pagesByUrl.get(normalizeUrl(tabUrl(tab))), boilerplate),
   }));
-  const { df, n } = vectorize(candidates, corpus);
+  const { df, n } = vectorize(candidates, stats, new Set(pagesByUrl.keys()));
   // A key term only links pages if it is not on most of everything the user reads. The bar is
   // high on purpose: while researching a subject, its word is on many of the user's pages.
-  const isRare = (s) => n < 20 || (df.get(s) ?? 0) / n <= 0.5;
+  const isRare = (s) => n < 20 || df(s) / n <= 0.5;
   const topicOf = assignTopics(candidates, registry, isRare);
   for (const tab of eligible) {
     const topic = topicOf.get(tab.id);
@@ -822,17 +857,27 @@ async function reconcile() {
 // ---------------------------------------------------------------------------------------------
 
 const INDEX_DELAY_MS = 1500;
+const REREAD_GAP_MS = 10000; // a tab that did not navigate is read at most this often
 const KEYWORDS_PER_PAGE = 150;
 const indexTimers = new Map(); // tabId -> timer
+const lastRead = new Map(); // tabId -> time of the last read
 
-function scheduleIndex(tabId) {
+/**
+ * Reads the tab soon (1.5 s). Repeated reads of a tab that did not navigate (title changes, leaving
+ * the tab, the content watcher) wait until REREAD_GAP_MS after the previous one, so pages that
+ * retitle themselves constantly ("(1) New message") cost one read per gap at most.
+ */
+function scheduleIndex(tabId, { navigated = false } = {}) {
+  const wait = navigated ? INDEX_DELAY_MS : Math.max(INDEX_DELAY_MS, (lastRead.get(tabId) ?? 0) + REREAD_GAP_MS - Date.now());
   clearTimeout(indexTimers.get(tabId));
   indexTimers.set(
     tabId,
     setTimeout(() => {
       indexTimers.delete(tabId);
+      // The first read after a page load (a chat retitling itself, results arriving) stays quick.
+      lastRead.set(tabId, navigated ? 0 : Date.now());
       indexTab(tabId).catch((error) => console.warn('[TabDeclutter] page memory failed', error));
-    }, INDEX_DELAY_MS),
+    }, wait),
   );
 }
 
@@ -868,7 +913,8 @@ async function indexTab(tabId) {
     return; // closed meanwhile
   }
   const url = tabUrl(tab);
-  if (tab.incognito || tab.status !== 'complete' || !getRootDomain(url)) return;
+  // Web pages and local files are remembered; browser and extension pages are not readable.
+  if (tab.incognito || tab.status !== 'complete' || !/^(https?|file):/.test(url) || !getRootDomain(url)) return;
   if ((await chrome.storage.local.get(KEYS.MEMORY_PAUSED))[KEYS.MEMORY_PAUSED]) return;
 
   let page = { description: '', headings: '', intent: '', text: '' };
@@ -886,7 +932,8 @@ async function indexTab(tabId) {
   for (const s of contentStems(`${tab.title} ${page.intent} ${page.headings} ${page.description} ${page.text}`)) {
     counts.set(s, (counts.get(s) ?? 0) + 1);
   }
-  await pageMemory.remember({
+  const top = [...counts].sort((a, b) => b[1] - a[1]).slice(0, KEYWORDS_PER_PAGE);
+  const record = {
     url: normalizeUrl(url),
     title: tab.title || url,
     host: new URL(url).hostname,
@@ -894,13 +941,24 @@ async function indexTab(tabId) {
     description: page.description,
     headings: page.headings,
     intent: page.intent,
-    ...(() => {
-      const top = [...counts].sort((a, b) => b[1] - a[1]).slice(0, KEYWORDS_PER_PAGE);
-      return { keywords: top.map(([s]) => s), keywordCounts: top.map(([, n]) => n) };
-    })(),
+    keywords: top.map(([s]) => s),
+    keywordCounts: top.map(([, n]) => n),
     lastVisited: Date.now(),
-  });
-  scheduleRegroup(tab.windowId, tabId); // new content may reveal a cross-site topic
+  };
+  // Most re-reads find the same page (a flashing title, a ticking counter). Then there is nothing to
+  // save or regroup; only the visit time is refreshed now and then for memory eviction.
+  const previous = await pageMemory.get(record.url).catch(() => undefined);
+  const same = (field) => String(previous?.[field]) === String(record[field]);
+  const unchanged = previous && ['title', 'description', 'headings', 'intent', 'keywords', 'keywordCounts'].every(same);
+  if (unchanged && record.lastVisited - previous.lastVisited < 10 * 60 * 1000) return;
+  const { previous: replaced, saved, evicted } = await pageMemory.remember(record);
+  const stats = corpusStats && (await corpusStats);
+  if (stats) {
+    if (replaced) countPage(stats, replaced, -1);
+    countPage(stats, saved, 1);
+    for (const page of evicted) countPage(stats, page, -1);
+  }
+  if (!unchanged) scheduleRegroup(tab.windowId, tabId); // new content may reveal a cross-site topic
 }
 
 // From watch.js: the page's content changed and has settled (results loaded, a chat answer finished).
