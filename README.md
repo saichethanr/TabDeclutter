@@ -16,9 +16,15 @@ Everything runs inside your browser. No account, no servers, no data leaves your
   - Tabs are grouped by **what the pages are about**, first and foremost. A tutorial, a blog post, and a forum question about the same thing go into `🔍 Rust async`. Two ChatGPT chats, one asking "is Claude Code the best?" and one asking "who created Claude Code?", go into `🔍 Claude code`.
   - It works for pages whose content loads after they open: AI chats, search results, shopping searches. What you searched for or asked counts most, and groups update as soon as the content arrives. Two ChatGPT chats about guitar chords and a guitar-strings search on a shop go into `🔍 Guitar`.
   - Tabs that share no topic are grouped by website (`GitHub`, `Python`, …). Sites full of unrelated content (YouTube, Google, Stack Overflow, ChatGPT, Claude, Perplexity) get groups by subject such as `YouTube · lofi`, and their leftover tabs share one site group.
+  - Groups are named after the **task** when the pages are clearly one kind: a flight, a hotel, a travel blog and a packing-tips chat about Lisbon go into `✈️ Lisbon trip`; shopping, recipes, studying, job hunting and coding get 🛒 🍳 📚 💼 💻.
+  - A tab you open from a search or a chat follows it. Results opened from "things to do in lisbon" join `🔍 Lisbon`, and a blank ChatGPT tab opened from a Stack Overflow question joins that question's group until the chat says otherwise.
+  - In AI chats, the group is picked as soon as you send your question, not after the answer finishes.
   - Tabs that are not web pages are grouped too: local files (`Local files`), browser pages like Settings and History (`Browser pages`), and pages of other extensions (`Extension pages`).
 - **Finds any page by what you remember.** Type a few words, like "rust article about pinning", "that piano video", or "bread starter recipe". It searches your open tabs and pages you closed earlier, including the words inside the pages, not just their titles.
 - **Reminds you about forgotten tabs.** A tab you have not looked at for 2+ hours counts as "stale". The toolbar icon shows how many you have, and you get a gentle reminder now and then.
+- **Focus mode.** Expanding a group collapses the others, so only the task at hand stays in view.
+- **Sleeps idle groups.** A group you haven't touched for 30 minutes is collapsed and its tabs are unloaded to free memory. Click any tab to bring it back instantly. Tabs playing sound, pinned tabs, and tabs you typed into are never unloaded.
+- **Shares a group.** One click copies a group's links, ready to paste into Slack, email or a doc.
 - **Closes tabs safely.** "Archive & Safe Close" saves the page title and link to a history list before closing it, so you can always reopen it later.
 
 ## Install (about 2 minutes)
@@ -98,7 +104,20 @@ There is nothing to do: groups appear and update as you browse.
 
 - **Rename or recolor** a group by right-clicking its label in the tab bar. TabDeclutter keeps your changes.
 - **Keep a tab out of a group** by dragging it out. It stays out until you visit a different page in that tab.
+- **Correct a topic group** by dragging tabs: TabDeclutter learns from it. A page you drag out of a topic stays out of it, even when you open that page again later; a page you drag into a topic stays in. **Clear** (under Page memory) forgets these lessons too.
 - **Your own groups** (ones you create yourself) are never touched.
+
+### Share a group
+
+Under **Groups in this window**, click **Share** next to a group. Its links are copied:
+- in Slack, Gmail, Google Docs and similar apps they paste as clickable links under the group's name;
+- in plain-text places they paste as a Markdown list (`- [Title](link)`).
+
+### Focus mode and sleeping groups
+
+Both are on by default and can be switched off near the bottom of the popup.
+- **Focus mode**: when you expand a group, the other groups collapse. The group with the tab you are looking at stays open.
+- **Sleep idle groups**: after 30 minutes without use, a group is collapsed and its tabs are unloaded (Chrome keeps their titles and places). Clicking a tab reloads it. Tabs playing sound, pinned tabs, and tabs where you typed something are skipped, so unsent text is never lost.
 
 ### Clean up
 
@@ -118,7 +137,7 @@ Open **Recently archived** at the bottom of the popup and click any entry to reo
 
 The line at the bottom of the popup shows how many pages TabDeclutter remembers.
 - **Pause** stops remembering new pages (click **Resume** to turn it back on).
-- **Clear** deletes everything it remembers (click twice to confirm).
+- **Clear** deletes everything it remembers, including what it learned from tabs you dragged (click twice to confirm).
 
 ## Updating to a new version
 
@@ -162,10 +181,11 @@ Go to `chrome://extensions` and click **Remove** on the TabDeclutter card. This 
 | `popup.html` / `popup.js` | Dashboard, cleanup actions, page memory controls, and the command bar search. |
 | `watch.js` | Injected into readable pages; asks for a fresh read when the page's content changes and then settles. It sends no page content itself. |
 | `shared.js` | Storage keys, thresholds, text helpers, and the IndexedDB page memory used by both contexts. |
+| `tests/` | End-to-end tests in a headless Chrome: grouping accuracy, features, and CPU load (see `tests/README.md`). Not part of the zip. |
 | `styles.css` | All styles; no remote assets, so it works under the strict extension CSP. |
 
 How it decides:
-- **Topics**: each tab gets a TF-IDF word profile from its title, the search query in its URL, what the user searched or asked on the page, headings, description, URL, and frequent page words. Text a site repeats on many pages (shared titles and descriptions, navigation headings, interface words) is ignored, and page words weigh by how often they occur. Tabs form a topic group when their profiles are similar overall, or when they share a key term (one of the words each page repeats most) and their other words still overlap (one shared word alone is never enough), which keeps homonyms like Rust the language and rust on a pan apart. Topics form on the same site or across sites and take priority over site groups. Pages are re-read on load, when their title changes, when you switch away from them, and when `watch.js` sees their content change by a meaningful amount and then settle (ticking clocks and live counters are ignored). A tab that did not navigate is re-read at most every 10 seconds, the watcher backs off from 10 seconds to 5 minutes on pages that keep changing (endless feeds) until you click or type on the page, and a re-read that finds the same content saves nothing and starts no regroup. Topics formed from half-loaded pages merge once the pages turn out to be one subject, and topic labels refresh unless you renamed the group. Only tabs that are ungrouped, just navigated, or sit in a topic or general catch-all group are re-evaluated, and a group left with one tab dissolves.
+- **Topics**: each tab gets a TF-IDF word profile from its title, the search query in its URL, what the user searched or asked on the page, headings, description, URL, and frequent page words. Text a site repeats on many pages (shared titles and descriptions, navigation headings, interface words) is ignored, and page words weigh by how often they occur. Tabs form a topic group when their profiles are similar overall, or when they share a key term (one of the words each page repeats most) and their other words still overlap (one shared word alone is never enough), which keeps homonyms like Rust the language and rust on a pan apart. Topics form on the same site or across sites and take priority over site groups. Pages are re-read on load, when their title changes, when you switch away from them, and when `watch.js` sees their content change by a meaningful amount and then settle (ticking clocks and live counters are ignored). A tab that did not navigate is re-read at most every 10 seconds, the watcher backs off from 10 seconds to 5 minutes on pages that keep changing (endless feeds) until you click or type on the page, and a re-read that finds the same content saves nothing and starts no regroup. Tabs opened from a search, a chat or another page carry that page's words, so results opened from one search group together. Task words and sites (flights and hotels, recipes, courses, job boards, shops, code) name groups like "✈️ Lisbon trip" and help pages of the same task join. Every member of a new topic must relate to at least half of the others, and existing members leave once they relate to fewer than a third. Pairs of pages the user dragged into or out of a topic are remembered in `chrome.storage.local` (newest 1,000) and override the scores. Topics formed from half-loaded pages merge once the pages turn out to be one subject, and topic labels refresh unless you renamed the group. Only tabs that are ungrouped, just navigated, or sit in a topic or general catch-all group are re-evaluated, and a group left with one tab dissolves.
 - **Performance**: word statistics of page memory (how many pages use each word, and the text each site repeats) are kept in the service worker and updated as pages are saved, so a regroup pass reads only the open tabs' pages, not the whole memory.
 - **Stale**: the last time each tab was in the foreground is tracked in `chrome.storage.local`; a background tab is stale after 2 hours.
 - **Search**: scores title, site, URL, and remembered page words, with light word-stemming, typo tolerance, site-type words (video, spreadsheet, email, …), and extra weight for GitHub on code-related queries.

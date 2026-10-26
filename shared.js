@@ -11,7 +11,24 @@ export const STORAGE_KEYS = Object.freeze({
   LAST_NUDGE: 'lastNudgeAt',
   /** chrome.storage.local — true while page memory is paused */
   MEMORY_PAUSED: 'memoryPaused',
+  /** chrome.storage.local — user settings, see DEFAULT_SETTINGS */
+  SETTINGS: 'settings',
+  /** chrome.storage.local — { ["urlA\nurlB"]: { together, at } } learned from tabs the user moved into or out of topic groups */
+  PAIR_HINTS: 'pairHints',
 });
+
+export const DEFAULT_SETTINGS = Object.freeze({
+  /** Expanding a tab group collapses the other groups in its window. */
+  focusMode: true,
+  /** Groups nobody used for `sleepAfterMinutes` are collapsed and their tabs unloaded. */
+  sleepGroups: true,
+  sleepAfterMinutes: 30,
+});
+
+export async function readSettings() {
+  const { [STORAGE_KEYS.SETTINGS]: saved } = await chrome.storage.local.get(STORAGE_KEYS.SETTINGS);
+  return { ...DEFAULT_SETTINGS, ...saved };
+}
 
 /** A background tab is "stale" after this much time without focus. */
 export const STALE_AFTER_MS = 2 * 60 * 60 * 1000;
@@ -94,6 +111,16 @@ export const STOPWORDS = new Set([
   'shall', 'yes', 'yet', 'too', 'off', 'own', 'same', 'both', 'few', 'many', 'much', 'every', 'while',
   'after', 'before', 'because', 'between', 'during', 'without', 'within', 'upon', 'onto', 'www', 'com',
   'http', 'https', 'html', 'php', 'org', 'net',
+  // Common words in other languages (Spanish, Portuguese, French, German, Italian).
+  'para', 'con', 'los', 'las', 'del', 'una', 'uno', 'por', 'que', 'como', 'más', 'mas', 'sin', 'sus',
+  'este', 'esta', 'pero', 'muy', 'hay', 'ser', 'son', 'fue', 'entre', 'cuando', 'todo', 'todos',
+  'tras', 'ante', 'sobre', 'hasta', 'desde', 'durante', 'antes', 'después', 'nos', 'les', 'ella',
+  'ellos', 'cómo', 'qué', 'dos', 'tres', 'buen', 'buena', 'aos', 'das', 'dos', 'nas', 'nos', 'uma',
+  'com', 'não', 'mais', 'seu', 'sua', 'pelo', 'pela', 'les', 'des', 'une', 'dans', 'pour', 'avec',
+  'sur', 'pas', 'qui', 'est', 'sont', 'aux', 'ces', 'cette', 'mais', 'leur', 'tout', 'très', 'der',
+  'die', 'das', 'und', 'ist', 'mit', 'den', 'dem', 'des', 'ein', 'eine', 'einen', 'nicht', 'auf',
+  'für', 'von', 'sich', 'auch', 'wie', 'aus', 'bei', 'nach', 'oder', 'wird', 'sind', 'werden',
+  'della', 'delle', 'degli', 'nel', 'nella', 'alla', 'sono', 'anche', 'gli', 'questo', 'questa',
 ]);
 
 export function tokenize(text) {

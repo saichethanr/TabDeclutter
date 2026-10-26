@@ -9,6 +9,7 @@ import {
   isStale,
   normalizeUrl,
   pageMemory,
+  readSettings,
   searchQueryFromUrl,
   stem,
   tabUrl,
@@ -102,6 +103,11 @@ const els = {
   memoryStatus: $('memory-status'),
   memoryPause: $('memory-pause'),
   memoryClear: $('memory-clear'),
+  groupsPanel: $('groups-panel'),
+  groupList: $('groups'),
+  settingFocus: $('setting-focus'),
+  settingSleep: $('setting-sleep'),
+  sleepMinutes: $('sleep-minutes'),
   toast: $('toast'),
 };
 
@@ -119,6 +125,8 @@ const state = {
   closedDocs: [],
   results: [],
   selected: 0,
+  windowId: undefined,
+  settings: null,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -126,12 +134,16 @@ const state = {
 // ---------------------------------------------------------------------------------------------
 
 async function loadEcosystem() {
-  const [tabs, groups, store, pages] = await Promise.all([
+  const [tabs, groups, store, pages, win, settings] = await Promise.all([
     chrome.tabs.query({}),
     chrome.tabGroups.query({}),
     chrome.storage.local.get([KEYS.ACCESS, KEYS.AUTO_GROUPS, KEYS.ARCHIVE, KEYS.MEMORY_PAUSED]),
     pageMemory.getAll().catch(() => []),
+    chrome.windows.getCurrent().catch(() => null),
+    readSettings(),
   ]);
+  state.windowId = win?.id;
+  state.settings = settings;
   state.tabs = tabs;
   state.groups = new Map(groups.map((group) => [group.id, group]));
   state.access = store[KEYS.ACCESS] ?? {};
@@ -382,8 +394,77 @@ function renderDashboard() {
   els.archiveAll.disabled = false;
   els.archiveAll.textContent = `Archive all ${state.stale.length} stale`;
 
+  renderGroups();
   renderHistory();
   renderMemory();
+  renderSettings();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Groups in this window, each with a Share button
+// ---------------------------------------------------------------------------------------------
+
+function renderGroups() {
+  const members = new Map();
+  for (const tab of state.tabs) {
+    if (tab.windowId !== state.windowId || !state.groups.has(tab.groupId)) continue;
+    if (!members.has(tab.groupId)) members.set(tab.groupId, []);
+    members.get(tab.groupId).push(tab);
+  }
+  const items = [...members]
+    .sort((a, b) => a[1][0].index - b[1][0].index)
+    .map(([groupId, tabs]) => {
+      const group = state.groups.get(groupId);
+      const title = group.title || 'Untitled group';
+      const icon = el('span', 'group-dot');
+      icon.dataset.color = group.color ?? 'grey';
+      const asleep = tabs.every((tab) => tab.discarded);
+      const item = el('li', 'cleanup-item');
+      const text = el('button', 'cleanup-text');
+      text.type = 'button';
+      text.title = `${title}\n(click to go there)`;
+      text.append(el('span', 'cleanup-title', title), el('span', 'cleanup-meta', `${tabs.length} tab${tabs.length === 1 ? '' : 's'}${asleep ? ' · asleep, click to wake' : ''}`));
+      text.addEventListener('click', () => focusTab(tabs.find((t) => t.active) ?? tabs[0]));
+      const share = el('button', 'btn btn-ghost', 'Share');
+      share.type = 'button';
+      share.dataset.share = String(groupId);
+      share.title = 'Copy these links to paste into Slack, email or a doc';
+      share.addEventListener('click', () => shareGroup(title, tabs));
+      item.append(icon, text, share);
+      return item;
+    });
+  els.groupList.replaceChildren(...items);
+  els.groupsPanel.hidden = items.length === 0;
+}
+
+/**
+ * Copies a group as a list of links: rich links (HTML) where the paste target supports them, such
+ * as Slack, Gmail and Google Docs, and Markdown in plain-text editors.
+ */
+async function shareGroup(title, tabs) {
+  const escapeHtml = (text) => text.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
+  const links = tabs.map((tab) => ({ title: tab.title || tabUrl(tab), url: tabUrl(tab) }));
+  const markdown = [`**${title}** (${links.length} link${links.length === 1 ? '' : 's'})`, ...links.map((l) => `- [${l.title.replace(/[[\]]/g, '')}](${l.url})`)].join('\n');
+  const html = `<p><b>${escapeHtml(title)}</b></p><ul>${links.map((l) => `<li><a href="${escapeHtml(l.url)}">${escapeHtml(l.title)}</a></li>`).join('')}</ul>`;
+  try {
+    await navigator.clipboard.write([
+      new ClipboardItem({ 'text/plain': new Blob([markdown], { type: 'text/plain' }), 'text/html': new Blob([html], { type: 'text/html' }) }),
+    ]);
+  } catch {
+    await navigator.clipboard.writeText(markdown);
+  }
+  showToast(`Copied ${links.length} link${links.length === 1 ? '' : 's'} from “${title}”. Paste them into Slack, email or a doc.`);
+}
+
+function renderSettings() {
+  els.settingFocus.checked = state.settings.focusMode;
+  els.settingSleep.checked = state.settings.sleepGroups;
+  els.sleepMinutes.textContent = state.settings.sleepAfterMinutes;
+}
+
+async function saveSetting(change) {
+  state.settings = { ...state.settings, ...change };
+  await chrome.storage.local.set({ [KEYS.SETTINGS]: state.settings });
 }
 
 function formatAgo(timestamp) {
@@ -413,6 +494,7 @@ async function handleMemoryClear() {
   clearArmed = 0;
   els.memoryClear.textContent = 'Clear';
   await pageMemory.clear();
+  await chrome.storage.local.remove(KEYS.PAIR_HINTS);
   showToast('Page memory cleared. Open tabs are still searchable by title.');
   await refresh();
 }
@@ -723,6 +805,8 @@ els.memoryPause.addEventListener('click', async () => {
   await refresh();
 });
 els.memoryClear.addEventListener('click', handleMemoryClear);
+els.settingFocus.addEventListener('change', () => saveSetting({ focusMode: els.settingFocus.checked }));
+els.settingSleep.addEventListener('change', () => saveSetting({ sleepGroups: els.settingSleep.checked }));
 
 refresh().catch((error) => {
   console.error('[TabDeclutter] failed to load', error);

@@ -57,6 +57,13 @@
           </div>
         </section>
 
+        <section id="groups-panel" class="panel" aria-labelledby="groups-title" hidden>
+          <div class="panel-header">
+            <h2 id="groups-title" class="panel-title">Groups in this window</h2>
+          </div>
+          <ul id="groups" class="cleanup-list group-list"></ul>
+        </section>
+
         <section class="panel" aria-labelledby="cleanups-title">
           <div class="panel-header">
             <h2 id="cleanups-title" class="panel-title">Actionable Cleanups</h2>
@@ -73,6 +80,17 @@
           <summary class="history-summary">Recently archived (<span id="history-count">0</span>)</summary>
           <ul id="history-list" class="history-list"></ul>
         </details>
+
+        <section class="settings" aria-label="Settings">
+          <label class="setting">
+            <input id="setting-focus" type="checkbox" />
+            <span><strong>Focus mode</strong> · opening a group folds the others</span>
+          </label>
+          <label class="setting">
+            <input id="setting-sleep" type="checkbox" />
+            <span><strong>Sleep idle groups</strong> · unload groups unused for <span id="sleep-minutes">30</span> min</span>
+          </label>
+        </section>
 
         <footer class="memory">
           <span id="memory-status" class="memory-status">Remembering pages on this device</span>

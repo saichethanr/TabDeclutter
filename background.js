@@ -10,10 +10,12 @@ import {
   STOPWORDS,
   contentStems,
   countTabsByGroup,
+  getLastAccessed,
   getRootDomain,
   isStale,
   normalizeUrl,
   pageMemory,
+  readSettings,
   searchQueryFromUrl,
   stem,
   tabUrl,
@@ -100,6 +102,13 @@ chrome.tabs.onActivated.addListener(async ({ tabId, windowId }) => {
   await stamp([tabId, previous]);
   // The tab the user just left is now in its settled state (e.g. a finished chat answer): re-read it.
   if (previous !== undefined && previous !== tabId) scheduleIndex(previous);
+  // A group in use is awake again; it may sleep once it is left alone for long enough.
+  const { groupId } = await chrome.tabs.get(tabId).catch(() => ({}));
+  if (groupId !== undefined && groupId !== NO_GROUP) {
+    mutateStorage(chrome.storage.session, 'sleptGroups', (map) => {
+      delete map[groupId];
+    });
+  }
   scheduleHealthCheck();
 });
 
@@ -111,11 +120,53 @@ chrome.windows.onFocusChanged.addListener(async () => {
   scheduleHealthCheck();
 });
 
+// Where each tab came from: the search or chat it was opened from (or navigated away from). Its
+// subject is a strong hint for pages that say little about themselves, like a result page
+// opened from "things to do in lisbon" or a blank chat opened from a Stack Overflow question.
+const AI_CHAT_DOMAINS = new Set(['chatgpt.com', 'openai.com', 'claude.ai', 'perplexity.ai']);
+const lastUrls = new Map(); // tabId -> last URL seen (to notice navigating away from a search)
+
+function originFrom(url, title) {
+  const query = searchQueryFromUrl(url);
+  return { url: normalizeUrl(url), text: query || title || '', search: Boolean(query) || AI_CHAT_DOMAINS.has(getRootDomain(url)) };
+}
+
+chrome.tabs.onCreated.addListener(async (tab) => {
+  // Chrome fills in openerTabId just after this event, so look again shortly.
+  let openerId = tab.openerTabId;
+  for (let wait = 100; openerId === undefined && wait <= 400; wait *= 2) {
+    await new Promise((resolve) => setTimeout(resolve, wait));
+    openerId = (await chrome.tabs.get(tab.id).catch(() => null))?.openerTabId;
+  }
+  if (openerId === undefined) return;
+  const opener = await chrome.tabs.get(openerId).catch(() => null);
+  if (!opener || !getRootDomain(tabUrl(opener))) return;
+  await mutateStorage(chrome.storage.session, 'tabOrigins', (map) => {
+    map[tab.id] = originFrom(tabUrl(opener), opener.title);
+  });
+});
+
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (changeInfo.url) {
     if (tab.active) stamp([tabId]);
     forgetDetached(tabId);
+    mutateStorage(chrome.storage.session, 'typedTabs', (map) => {
+      delete map[tabId]; // text typed on the previous page is gone with it
+    });
+    // Leaving a search for a result keeps the search as the tab's origin; a new search replaces it.
+    const previous = lastUrls.get(tabId);
+    lastUrls.set(tabId, changeInfo.url);
+    if (searchQueryFromUrl(changeInfo.url)) {
+      mutateStorage(chrome.storage.session, 'tabOrigins', (map) => {
+        delete map[tabId];
+      });
+    } else if (previous && searchQueryFromUrl(previous) && getRootDomain(previous) !== getRootDomain(changeInfo.url)) {
+      mutateStorage(chrome.storage.session, 'tabOrigins', (map) => {
+        map[tabId] = originFrom(previous, '');
+      });
+    }
   }
+  if ('groupId' in changeInfo) learnFromMove(tab, changeInfo.groupId).catch((error) => console.warn('[TabDeclutter] learning failed', error));
   if ('groupId' in changeInfo && changeInfo.groupId === NO_GROUP && !selfReleased.has(tabId)) {
     // The user pulled this tab out of a group: leave it alone until it navigates elsewhere.
     mutateStorage(chrome.storage.session, 'detachedTabs', (map) => {
@@ -132,6 +183,12 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 
 chrome.tabs.onRemoved.addListener((tabId, { windowId, isWindowClosing }) => {
   lastRead.delete(tabId);
+  lastUrls.delete(tabId);
+  for (const key of ['tabOrigins', 'typedTabs', 'seenGroups']) {
+    mutateStorage(chrome.storage.session, key, (map) => {
+      delete map[tabId];
+    });
+  }
   mutateStorage(chrome.storage.local, KEYS.ACCESS, (map) => {
     delete map[tabId];
   });
@@ -152,20 +209,139 @@ chrome.tabs.onReplaced.addListener((addedTabId, removedTabId) => {
     map[addedTabId] = map[removedTabId] ?? Date.now();
     delete map[removedTabId];
   });
+  mutateStorage(chrome.storage.session, 'seenGroups', (map) => {
+    if (removedTabId in map) map[addedTabId] = map[removedTabId];
+    delete map[removedTabId];
+  });
 });
 
 chrome.tabs.onAttached.addListener((tabId, { newWindowId }) => scheduleRegroup(newWindowId, tabId));
 chrome.tabs.onDetached.addListener((_tabId, { oldWindowId }) => scheduleRegroup(oldWindowId));
 
 chrome.tabGroups.onRemoved.addListener((group) => {
+  collapsedGroups.delete(group.id);
   mutateStorage(chrome.storage.local, KEYS.AUTO_GROUPS, (registry) => {
     delete registry[group.id];
   });
 });
 
+// ---------------------------------------------------------------------------------------------
+// Focus mode: expanding a group collapses the other groups in its window, so only the task at
+// hand stays in view. The group holding the active tab is left open (collapsing it would make
+// Chrome switch tabs).
+// ---------------------------------------------------------------------------------------------
+
+const collapsedGroups = new Map(); // groupId -> collapsed, as last seen
+let lastExpanded = null;
+chrome.tabGroups.query({}).then((groups) => groups.forEach((group) => collapsedGroups.set(group.id, group.collapsed)));
+chrome.tabGroups.onCreated.addListener((group) => collapsedGroups.set(group.id, group.collapsed));
+
+chrome.tabGroups.onUpdated.addListener(async (group) => {
+  const wasCollapsed = collapsedGroups.get(group.id);
+  collapsedGroups.set(group.id, group.collapsed);
+  if (wasCollapsed !== true || group.collapsed) return; // only reacts to a group being expanded
+  lastExpanded = group.id;
+  if (!(await readSettings()).focusMode) return;
+  const [open, [active]] = await Promise.all([
+    chrome.tabGroups.query({ windowId: group.windowId, collapsed: false }),
+    chrome.tabs.query({ active: true, windowId: group.windowId }),
+  ]);
+  if (lastExpanded !== group.id) return; // another group was expanded since; that one wins
+  for (const other of open) {
+    if (other.id === group.id || other.id === active?.groupId) continue;
+    await chrome.tabGroups.update(other.id, { collapsed: true }).catch(() => {});
+  }
+});
+
+// ---------------------------------------------------------------------------------------------
+// Sleeping groups: a group nobody has used for a while (30 minutes by default) is collapsed and
+// its tabs are unloaded with Chrome's own discard, which frees their memory. A discarded tab keeps
+// its place, title and icon, and reloads the moment it is clicked. Tabs playing audio, pinned
+// tabs, and tabs the user typed into (unsent text would be lost) are never unloaded.
+// ---------------------------------------------------------------------------------------------
+
+const SLEEP_ALARM = 'sleep-groups';
+chrome.alarms.get(SLEEP_ALARM).then((alarm) => {
+  if (!alarm) chrome.alarms.create(SLEEP_ALARM, { periodInMinutes: 1 });
+});
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === SLEEP_ALARM) sleepIdleGroups().catch((error) => console.warn('[TabDeclutter] sleep failed', error));
+});
+
+async function sleepIdleGroups() {
+  const settings = await readSettings();
+  if (!settings.sleepGroups) return;
+  const [tabs, groups, access, typed, slept] = await Promise.all([
+    chrome.tabs.query({}),
+    chrome.tabGroups.query({}),
+    readKey(chrome.storage.local, KEYS.ACCESS),
+    readKey(chrome.storage.session, 'typedTabs'),
+    readKey(chrome.storage.session, 'sleptGroups'),
+  ]);
+  const cutoff = Date.now() - settings.sleepAfterMinutes * 60 * 1000;
+  for (const group of groups) {
+    // Each idle stretch puts a group to sleep once, so expanding it to look does not re-collapse it.
+    if (slept[group.id]) continue;
+    const members = tabs.filter((tab) => tab.groupId === group.id);
+    if (!members.length || members.some((tab) => tab.active)) continue;
+    if (Math.max(...members.map((tab) => getLastAccessed(tab, access) ?? 0)) > cutoff) continue;
+    for (const tab of members) {
+      if (tab.discarded || tab.audible || tab.pinned || tab.autoDiscardable === false || typed[tab.id]) continue;
+      await chrome.tabs.discard(tab.id).catch(() => {});
+    }
+    if (!group.collapsed) await chrome.tabGroups.update(group.id, { collapsed: true }).catch(() => {});
+    await mutateStorage(chrome.storage.session, 'sleptGroups', (map) => {
+      map[group.id] = true;
+    });
+  }
+}
+
 function forgetDetached(tabId) {
   mutateStorage(chrome.storage.session, 'detachedTabs', (map) => {
     delete map[tabId];
+  });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Learning from corrections: dragging a tab out of a topic group teaches that its page does not
+// belong with the pages left there; dragging one in teaches that it does. Hints are kept per pair
+// of pages, so they hold when the pages are opened again later.
+// ---------------------------------------------------------------------------------------------
+
+const PAIR_HINT_LIMIT = 1000;
+const selfGrouped = new Set(); // tabs this worker is moving into a group (not a user action)
+const pairKey = (a, b) => (a < b ? `${a}\n${b}` : `${b}\n${a}`);
+
+async function learnFromMove(tab, groupId) {
+  const byUs = selfGrouped.has(tab.id) || selfReleased.has(tab.id);
+  // seenGroups[tabId] = the group each tab was last seen in (kept in session storage, because the
+  // worker may have been asleep since).
+  const from = await mutateStorage(chrome.storage.session, 'seenGroups', (map) => {
+    const previous = map[tab.id];
+    map[tab.id] = groupId;
+    return previous;
+  });
+  if (byUs || from === undefined || from === groupId || !getRootDomain(tabUrl(tab))) return;
+  const registry = await readKey(chrome.storage.local, KEYS.AUTO_GROUPS);
+  const isTopic = (id) => Boolean(registry[id]?.key?.startsWith('topic:'));
+  if (!isTopic(from) && !isTopic(groupId)) return;
+  // Ungrouping a whole group moves every tab out; wait so that reads as an empty group, not as
+  // each page disowning the others.
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  if ((await chrome.tabs.get(tab.id).catch(() => null))?.groupId !== groupId) return;
+  const membersOf = async (id) =>
+    isTopic(id) ? (await chrome.tabs.query({ groupId: id })).filter((t) => t.id !== tab.id && getRootDomain(tabUrl(t))) : [];
+  const [left, joined] = await Promise.all([membersOf(from), membersOf(groupId)]);
+  if (!left.length && !joined.length) return;
+  const page = normalizeUrl(tabUrl(tab));
+  await mutateStorage(chrome.storage.local, KEYS.PAIR_HINTS, (hints) => {
+    const at = Date.now();
+    for (const t of left) hints[pairKey(page, normalizeUrl(tabUrl(t)))] = { together: false, at };
+    for (const t of joined) hints[pairKey(page, normalizeUrl(tabUrl(t)))] = { together: true, at };
+    const keys = Object.keys(hints);
+    if (keys.length > PAIR_HINT_LIMIT) {
+      keys.sort((a, b) => hints[a].at - hints[b].at).slice(0, keys.length - PAIR_HINT_LIMIT).forEach((k) => delete hints[k]);
+    }
   });
 }
 
@@ -286,12 +462,61 @@ async function withRetry(operation, attempts = 3) {
 
 const TOPIC_PREFIX = '🔍 ';
 const TOPIC_JOIN = 0.3; // similarity needed to form or join a topic
-const TOPIC_STAY = 0.15; // lower bar to stay in one, so groups do not flicker
 // Pages sharing a key term must also overlap this much in their other words (raw word weights, so
 // it does not swing with the size of page memory). A word with two meanings ("rust" the language
 // vs. rust on cast iron) or a generic one ("recipe") is not enough on its own.
-const KEY_TERM_CONTEXT = 0.09;
-const KEY_TERMS_PER_PAGE = 8;
+const KEY_TERM_CONTEXT = 0.07;
+const KEY_TERMS_PER_PAGE = 12;
+// A subject both pages name in their titles, searches or prompts needs only a little agreement
+// from the rest of the pages: any other shared word ("snake", "bread"), but not none at all.
+const SUBJECT_CONTEXT = 0.02;
+const BRIEF_TERMS = 30; // a page with fewer distinct words than this is short
+const BROAD_JOIN = 0.2; // a lower similarity is enough when the pages share many words
+const BROAD_TERMS = 5;
+
+/**
+ * Kinds of task a group of pages can be, recognized from typical words and sites. A topic whose
+ * pages are mostly one kind is labelled as that task ("✈️ Lisbon trip"), and two pages of the same
+ * kind that name the same subject belong together (a flight and a hotel for Lisbon).
+ */
+const TASKS = [
+  { emoji: '✈️', suffix: 'trip', words: 'flight airline airport hotel hostel resort booking itinerary travel trip vacation holiday visa tour sightseeing attraction passport luggage packing airbnb guesthouse destination', sites: ['booking.com', 'airbnb.com', 'expedia.com', 'skyscanner.net', 'skyscanner.com', 'kayak.com', 'tripadvisor.com', 'makemytrip.com', 'agoda.com', 'hotels.com', 'goibibo.com', 'trip.com', 'cleartrip.com'] },
+  { emoji: '🛒', suffix: '', words: 'buy price deal cart discount offer sale shipping order shop shopping coupon warranty specs', sites: ['amazon.com', 'amazon.in', 'flipkart.com', 'ebay.com', 'walmart.com', 'bestbuy.com', 'etsy.com', 'aliexpress.com', 'target.com', 'myntra.com'] },
+  { emoji: '🍳', suffix: '', words: 'recipe ingredient bake baking cook cooking oven dough flour sauce dinner dessert kitchen', sites: ['allrecipes.com', 'bbcgoodfood.com', 'seriouseats.com', 'foodnetwork.com'] },
+  { emoji: '📚', suffix: '', words: 'lecture course exam quiz flashcard homework study textbook chapter biology chemistry physics encyclopedia class lesson', sites: ['wikipedia.org', 'khanacademy.org', 'coursera.org', 'quizlet.com', 'udemy.com', 'edx.org', 'britannica.com'] },
+  { emoji: '💼', suffix: 'jobs', words: 'job hiring resume interview salary career recruiter vacancy applicant', sites: ['linkedin.com', 'indeed.com', 'glassdoor.com', 'naukri.com', 'monster.com'] },
+  { emoji: '💻', suffix: '', words: 'code coding error exception function api bug debug compile library install npm syntax variable repository commit deploy runtime compiler', sites: ['github.com', 'stackoverflow.com', 'gitlab.com', 'developer.mozilla.org', 'npmjs.com', 'pypi.org'] },
+].map((task) => ({ ...task, words: new Set(task.words.split(' ').map(stem)) }));
+const TASK_WORDS = new Set(TASKS.flatMap((task) => [...task.words]));
+const TOPIC_PREFIXES = [TOPIC_PREFIX, ...TASKS.map((task) => `${task.emoji} `)];
+/** The words of a topic group's title, without its 🔍 or task emoji. */
+const topicText = (title) => (TOPIC_PREFIXES.find((prefix) => title?.startsWith(prefix)) ? title.slice(title.indexOf(' ') + 1) : null);
+
+// Title words that describe the page type rather than its subject.
+const GENERIC_SUBJECTS = new Set(
+  ['new', 'best', 'top', 'official', 'video', 'full', 'part', 'review', 'guide', 'tip', 'fact', 'photo',
+    'price', 'updated', 'update', 'cheap', 'free', 'online', 'complete', 'ultimate', 'beginner', 'easy',
+    'quick', 'simple', 'introduction', 'overview', 'help', 'question', 'answer', 'tutorial', 'documentation',
+    'list', 'day', 'today', 'latest', 'news', 'compare'].map(stem),
+);
+
+/** A title without the site name it often ends with ("Photosynthesis - Wikipedia", "grid | MDN"). */
+function subjectOfTitle(title) {
+  const parts = (title ?? '').split(/\s+[|·•—–-]\s+/);
+  return parts.length > 1 && tokenize(parts.at(-1)).length <= 3 ? parts.slice(0, -1).join(' ') : title ?? '';
+}
+
+/** The kind of task a page is, if its words or site clearly say so. */
+function taskOf(weights, domain) {
+  const scores = TASKS.map((task) => {
+    let score = task.sites.includes(domain) ? 4 : 0;
+    for (const [s, w] of weights) if (task.words.has(s)) score += w;
+    return score;
+  });
+  const best = Math.max(...scores);
+  const runnerUp = Math.max(...scores.filter((_, i) => i !== scores.indexOf(best)));
+  return best >= 4 && best >= 1.5 * runnerUp ? TASKS[scores.indexOf(best)] : null;
+}
 const WEB_NOISE = new Set(
   [
     'sign', 'login', 'log', 'menu', 'search', 'home', 'cookie', 'cookies', 'privacy', 'policy', 'terms',
@@ -394,7 +619,7 @@ function siteBoilerplate(stats, tabs, pagesByUrl) {
 const isIdLike = (word) => /^\d+$/.test(word) || (/\d/.test(word) && word.length >= 6);
 
 /** Weighted term profile of one tab, plus the readable spelling of each stem (for labels). */
-function topicProfile(tab, page, boilerplate) {
+function topicProfile(tab, page, boilerplate, origin) {
   const url = tabUrl(tab);
   const domain = getRootDomain(url);
   let host = '';
@@ -440,6 +665,10 @@ function topicProfile(tab, page, boilerplate) {
     const weight = count ? 1 + Math.log(count) : 2 / (1 + rank / 8);
     weights.set(s, (weights.get(s) ?? 0) + weight);
   });
+  // A page with almost nothing of its own yet (a blank chat, a result still loading) is "thin".
+  const thin = weights.size < 4;
+  // What the tab was opened from: the search or chat that led to it (see tabOrigins).
+  addText(origin?.text, 1.5);
 
   // Key terms: the few words a page repeats most, plus its title words. Two chats about guitars
   // can share little else ("F chord" vs "buying an acoustic"), but both keep saying "guitar".
@@ -447,9 +676,15 @@ function topicProfile(tab, page, boilerplate) {
   (page?.keywords ?? []).forEach((s, rank) => {
     if (keep(s) && !isIdLike(s)) prominence.set(s, page.keywordCounts?.[rank] ?? Math.max(1, 6 - rank / 5));
   });
-  for (const word of tokenize(`${title} ${query} ${page?.intent ?? ''}`)) {
+  // Subject words: what the title, the search, the prompt or the search it came from names.
+  const titleTerms = new Set();
+  const usable = (word) => word.length >= 3 && !STOPWORDS.has(word) && !isIdLike(word) && keep(stem(word));
+  for (const word of tokenize(`${title} ${query} ${page?.intent ?? ''} ${origin?.text ?? ''}`)) {
+    if (usable(word)) prominence.set(stem(word), (prominence.get(stem(word)) ?? 0) + 3);
+  }
+  for (const word of tokenize(`${subjectOfTitle(title)} ${query} ${page?.intent ?? ''} ${origin?.text ?? ''}`)) {
     const s = stem(word);
-    if (word.length >= 3 && !STOPWORDS.has(word) && !isIdLike(word) && keep(s)) prominence.set(s, (prominence.get(s) ?? 0) + 3);
+    if (usable(word) && !TASK_WORDS.has(s) && !GENERIC_SUBJECTS.has(s)) titleTerms.add(s);
   }
   const keyTerms = new Set(
     [...prominence]
@@ -458,7 +693,7 @@ function topicProfile(tab, page, boilerplate) {
       .slice(0, KEY_TERMS_PER_PAGE)
       .map(([s]) => s),
   );
-  return { weights, surface, keyTerms, url: normalizeUrl(url) };
+  return { weights, surface, keyTerms, titleTerms, thin, origin, task: taskOf(weights, domain), url: normalizeUrl(url) };
 }
 
 /** Turns raw profiles into unit-length TF-IDF vectors, using page memory as the document corpus. */
@@ -515,17 +750,28 @@ function topicLabel(members) {
   for (const { vector } of members) for (const [s, v] of vector) weight.set(s, (weight.get(s) ?? 0) + v);
   const ranked = [...weight]
     .filter(([s]) => sharedBy(s, 'vector') >= need)
-    .map(([s, w]) => ({ s, w, key: sharedBy(s, 'keyTerms') >= need }))
-    .sort((a, b) => b.key - a.key || b.w - a.w);
+    .map(([s, w]) => ({ s, w, key: sharedBy(s, 'keyTerms') >= need, cover: sharedBy(s, 'vector'), titled: sharedBy(s, 'titleTerms') }))
+    // Key terms first, then the word found on the most members, then in the most titles: "Guitar"
+    // over "Strings" when one guitar chat never mentions strings, and over "Chords" when only some
+    // titles say chords.
+    .sort((a, b) => b.key - a.key || b.cover - a.cover || b.titled - a.titled || b.w - a.w)
+    // Generic words ("beginner", "review") make poor names when anything better is shared.
+    .sort((a, b) => GENERIC_SUBJECTS.has(a.s) - GENERIC_SUBJECTS.has(b.s));
   if (!ranked.length) return null;
   const [first, second] = ranked;
   // A second word only when it is just as central to the members, so a label never reads like a
   // sub-topic of one page ("Guitar", not "Guitar chord").
   const most = Math.ceil(members.length * 0.75);
   const central = (s) => sharedBy(s, 'vector') >= most && (!first.key || sharedBy(s, 'keyTerms') >= most);
-  const words = second && central(second.s) && (first.key ? second.key : second.w >= 0.6 * first.w) ? [first, second] : [first];
-  const label = words.map(({ s }) => members.find((m) => m.surface.has(s))?.surface.get(s) ?? s).join(' ');
-  return TOPIC_PREFIX + label.charAt(0).toUpperCase() + label.slice(1);
+  // A word on every member and nearly as weighty also qualifies, so an adjective gets its noun
+  // ("Acoustic guitar").
+  const pair = second && ((central(second.s) && (first.key ? second.key : second.w >= 0.6 * first.w)) || (second.cover === members.length && second.w >= 0.6 * first.w));
+  const words = pair ? [first, second] : [first];
+  let label = words.map(({ s }) => members.find((m) => m.surface.has(s))?.surface.get(s) ?? s).join(' ');
+  // Mostly one kind of task: "✈️ Lisbon trip", "📚 Photosynthesis"; otherwise "🔍 Guitar".
+  const task = TASKS.find((t) => members.filter((m) => m.task === t).length >= Math.ceil(members.length * 0.75));
+  if (task?.suffix && !words.some(({ s }) => task.words.has(s))) label = `${label.split(' ')[0]} ${task.suffix}`;
+  return `${task ? `${task.emoji} ` : TOPIC_PREFIX}${label.charAt(0).toUpperCase()}${label.slice(1)}`;
 }
 
 /** Cosine similarity of two vectors after removing some terms (and renormalizing). */
@@ -545,13 +791,43 @@ function cosineWithout(a, b, drop) {
  * Existing topic members stay while they still fit; other tabs join the closest fitting topic; the
  * rest form new topics around the best-connected tab.
  */
-function assignTopics(candidates, registry, isRare) {
-  const related = (a, b) => {
+function assignTopics(candidates, registry, isRare, hints = {}) {
+  // Opened from the same search or chat (or from the other tab itself). For a page with content of
+  // its own this needs the origin to be a search or a chat; a thin page (a blank chat opened from a
+  // Stack Overflow question) follows any opener until its own content says otherwise.
+  const bornTogether = (a, b) =>
+    a.origin && (a.origin.url === b.url || a.origin.url === b.origin?.url) && (a.origin.search || a.thin);
+  const isRelated = (a, b) => {
+    // What the user taught by moving tabs into or out of topic groups wins.
+    const hint = hints[pairKey(a.url, b.url)];
+    if (hint) return hint.together;
+    if (bornTogether(a, b) || bornTogether(b, a)) return true;
     // A single shared word is not enough on its own: before a page loads its profile can be just
     // a few title words, and "beginner" alone does not make two pages one topic.
-    if (cosine(a.vector, b.vector) >= TOPIC_JOIN && sharedTerms(a.vector, b.vector) >= 2) return true;
+    const similarity = cosine(a.vector, b.vector);
+    const overlap = sharedTerms(a.vector, b.vector);
+    if (similarity >= TOPIC_JOIN && overlap >= 2) return true;
+    // Broad overlap: many shared words, none of them central (a guitar chat and a strings shop).
+    if (similarity >= BROAD_JOIN && overlap >= BROAD_TERMS) return true;
     const shared = new Set([...a.keyTerms].filter((s) => b.keyTerms.has(s) && isRare(s)));
-    return shared.size > 0 && cosineWithout(a.weights, b.weights, shared) >= KEY_TERM_CONTEXT;
+    if (shared.size > 0 && cosineWithout(a.weights, b.weights, shared) >= KEY_TERM_CONTEXT) return true;
+    // A subject both pages name in a title, search or prompt ("lisbon", "sourdough"): enough when
+    // both are the same kind of task (a flight and a hotel) or anything else on the pages agrees.
+    // Homonyms (Jaguar the car and the cat) share the name and nothing else.
+    const subject = new Set([...a.titleTerms].filter((s) => b.titleTerms.has(s) && isRare(s)));
+    if (!subject.size) return false;
+    if ((a.task && a.task === b.task) || cosineWithout(a.weights, b.weights, subject) >= SUBJECT_CONTEXT) return true;
+    // Short pages (a list of search results, a one-line answer) carry little weight: for them one
+    // more shared word ("sourdough" results and a recipe that both say "bread") is enough.
+    const brief = a.weights.size < BRIEF_TERMS || b.weights.size < BRIEF_TERMS;
+    return brief && sharedTerms(a.weights, b.weights) > subject.size;
+  };
+  const memo = new Map();
+  candidates.forEach((c, i) => (c.index = i));
+  const related = (a, b) => {
+    const key = a.index < b.index ? `${a.index} ${b.index}` : `${b.index} ${a.index}`;
+    if (!memo.has(key)) memo.set(key, isRelated(a, b));
+    return memo.get(key);
   };
 
   const topics = new Map(); // key -> { title, members }
@@ -564,9 +840,9 @@ function assignTopics(candidates, registry, isRare) {
   for (const [key, topic] of topics) {
     topic.members = topic.members.filter((m) => {
       const others = topic.members.filter((o) => o !== m);
-      if (!others.length) return false;
-      const rest = centroid(others);
-      return (cosine(m.vector, rest) >= TOPIC_STAY && sharedTerms(m.vector, rest) >= 2) || others.some((o) => related(m, o));
+      // A member stays while it relates to at least a third of the others, so a page that got in
+      // while the group was small leaves once the group shows what it is really about.
+      return others.length > 0 && others.filter((o) => related(m, o)).length >= Math.max(1, Math.ceil(others.length / 3));
     });
     if (topic.members.length < MIN_GROUP_SIZE) topics.delete(key);
   }
@@ -593,10 +869,25 @@ function assignTopics(candidates, registry, isRare) {
     for (const topic of topics.values()) {
       const center = centroid(topic.members);
       const similarity = cosine(c.vector, center);
-      const fits = (similarity >= TOPIC_JOIN && sharedTerms(c.vector, center) >= 2) || 2 * topic.members.filter((m) => related(c, m)).length >= topic.members.length;
+      // Resembling the topic as a whole is not enough on its own (a Tokyo flight resembles a Lisbon
+      // trip through its flight page): the tab must also relate to at least one member.
+      const linked = topic.members.filter((m) => related(c, m)).length;
+      const fits = (similarity >= TOPIC_JOIN && sharedTerms(c.vector, center) >= 2 && linked > 0) || 2 * linked >= topic.members.length;
       if (fits && similarity > bestScore) [best, bestScore] = [topic, similarity];
     }
     best?.members.push(c);
+  }
+
+  // Joining can change what a topic is about: recheck that every member still relates to at
+  // least a third of the others, dropping the weakest first.
+  for (const [key, topic] of topics) {
+    for (;;) {
+      const links = topic.members.map((m) => topic.members.filter((o) => o !== m && related(m, o)).length);
+      const weakest = links.indexOf(Math.min(...links));
+      if (topic.members.length <= MIN_GROUP_SIZE || links[weakest] >= Math.max(1, Math.ceil((topic.members.length - 1) / 3))) break;
+      topic.members.splice(weakest, 1);
+    }
+    if (topic.members.length < MIN_GROUP_SIZE || !topic.members.some((m, i) => topic.members.some((o, j) => i !== j && related(m, o)))) topics.delete(key);
   }
 
   const rest = candidates.filter((c) => !inTopic(c));
@@ -606,11 +897,20 @@ function assignTopics(candidates, registry, isRare) {
   for (const i of order) {
     if (used.has(rest[i])) continue;
     const members = [rest[i], ...neighbors[i].filter((d) => !used.has(d))];
+    // Every member must relate to at least half of the others, so a topic does not chain through
+    // one page (a Lisbon flight is also "from Mumbai" like a Tokyo flight, but nothing else is).
+    for (;;) {
+      const links = members.map((m) => members.filter((o) => o !== m && related(m, o)).length);
+      let weakest = -1; // never the seed (index 0)
+      for (let k = 1; k < members.length; k++) if (weakest < 0 || links[k] < links[weakest]) weakest = k;
+      if (weakest < 0 || 2 * links[weakest] >= members.length - 1) break;
+      members.splice(weakest, 1);
+    }
     if (members.length < MIN_GROUP_SIZE) continue;
     const title = topicLabel(members);
     if (!title) continue;
     members.forEach((m) => used.add(m));
-    const key = `topic:${title.slice(TOPIC_PREFIX.length).toLowerCase()}`;
+    const key = `topic:${topicText(title).toLowerCase()}`;
     const topic = topics.get(key) ?? { title, members: [] };
     topic.members.push(...members);
     topics.set(key, topic);
@@ -640,12 +940,14 @@ async function regroupWindow(windowId, changed) {
   }
   if (win.type !== 'normal') return; // tab groups exist only in normal windows
 
-  const [tabs, liveGroups, registry, detached, stats] = await Promise.all([
+  const [tabs, liveGroups, registry, detached, origins, stats, hints] = await Promise.all([
     chrome.tabs.query({ windowId }),
     chrome.tabGroups.query({ windowId }),
     readKey(chrome.storage.local, KEYS.AUTO_GROUPS),
     readKey(chrome.storage.session, 'detachedTabs'),
+    readKey(chrome.storage.session, 'tabOrigins'),
     loadCorpusStats(),
+    readKey(chrome.storage.local, KEYS.PAIR_HINTS),
   ]);
 
   const groupByKey = new Map(); // key -> live auto group id in this window
@@ -679,13 +981,13 @@ async function regroupWindow(windowId, changed) {
   const boilerplate = siteBoilerplate(stats, tabs, pagesByUrl);
   const candidates = eligible.map((tab) => ({
     tab,
-    ...topicProfile(tab, pagesByUrl.get(normalizeUrl(tabUrl(tab))), boilerplate),
+    ...topicProfile(tab, pagesByUrl.get(normalizeUrl(tabUrl(tab))), boilerplate, origins[tab.id]),
   }));
   const { df, n } = vectorize(candidates, stats, new Set(pagesByUrl.keys()));
   // A key term only links pages if it is not on most of everything the user reads. The bar is
   // high on purpose: while researching a subject, its word is on many of the user's pages.
   const isRare = (s) => n < 20 || df(s) / n <= 0.5;
-  const topicOf = assignTopics(candidates, registry, isRare);
+  const topicOf = assignTopics(candidates, registry, isRare, hints);
   for (const tab of eligible) {
     const topic = topicOf.get(tab.id);
     if (topic) place(topic.key, topic.title, tab);
@@ -752,6 +1054,8 @@ async function regroupWindow(windowId, changed) {
     }
     const tabIds = members.filter((tab) => tab.groupId !== existingId).map((tab) => tab.id);
     if (!tabIds.length) continue;
+    tabIds.forEach((id) => selfGrouped.add(id));
+    setTimeout(() => tabIds.forEach((id) => selfGrouped.delete(id)), 5000);
     const groupId = await withRetry(() =>
       chrome.tabs.group(
         existingId === undefined ? { tabIds, createProperties: { windowId } } : { groupId: existingId, tabIds },
@@ -778,6 +1082,10 @@ async function regroupWindow(windowId, changed) {
   }
 
   // Step 6: refresh tab counts and the "overloaded" flag of every auto group in this window.
+  // Tabs never seen moving between groups start from where they are now (see learnFromMove).
+  await mutateStorage(chrome.storage.session, 'seenGroups', (map) => {
+    for (const tab of finalTabs) map[tab.id] ??= tab.groupId;
+  });
   await mutateStorage(chrome.storage.local, KEYS.AUTO_GROUPS, (reg) => {
     Object.assign(reg, created);
     for (const [groupId, title] of Object.entries(renamed)) if (reg[groupId]) reg[groupId].title = title;
@@ -802,7 +1110,7 @@ async function release(tabIds) {
 
 /** Recognizes a group restored from a previous session that this extension originally created. */
 function inferAutoKey(group, members) {
-  if (group.title?.startsWith(TOPIC_PREFIX)) return `topic:${group.title.slice(TOPIC_PREFIX.length).toLowerCase()}`;
+  if (topicText(group.title)) return `topic:${topicText(group.title).toLowerCase()}`;
   const domains = new Set(members.map((tab) => getRootDomain(tabUrl(tab))));
   if (domains.size !== 1) return null;
   const [domain] = domains;
@@ -961,9 +1269,19 @@ async function indexTab(tabId) {
   if (!unchanged) scheduleRegroup(tab.windowId, tabId); // new content may reveal a cross-site topic
 }
 
-// From watch.js: the page's content changed and has settled (results loaded, a chat answer finished).
+// From watch.js: the page content changed and settled (results loaded, a chat answer finished), or
+// the user just sent a chat prompt.
 chrome.runtime.onMessage.addListener((message, sender) => {
-  if (message?.type === 'page-settled' && sender.tab?.id !== undefined) scheduleIndex(sender.tab.id);
+  if (sender.tab?.id === undefined) return;
+  if (message?.type === 'page-settled') scheduleIndex(sender.tab.id);
+  // A just-sent chat prompt is read right away (like a navigation), not after the re-read gap.
+  if (message?.type === 'prompt-sent') scheduleIndex(sender.tab.id, { navigated: true });
+  // The user typed into a field: unloading this tab could lose their text, so it never sleeps.
+  if (message?.type === 'typed') {
+    mutateStorage(chrome.storage.session, 'typedTabs', (map) => {
+      map[sender.tab.id] = true;
+    });
+  }
 });
 
 chrome.runtime.onInstalled.addListener(reconcile);
@@ -979,6 +1297,7 @@ function scheduleHealthCheck() {
   clearTimeout(healthTimer);
   healthTimer = setTimeout(() => {
     refreshHealth().catch((error) => console.warn('[TabDeclutter] health check failed', error));
+    sleepIdleGroups().catch((error) => console.warn('[TabDeclutter] sleep failed', error));
   }, HEALTH_DEBOUNCE_MS);
 }
 

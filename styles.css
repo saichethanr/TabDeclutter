@@ -591,6 +591,49 @@ button {
   font-size: 11px;
 }
 
+/* Groups panel */
+
+.group-list {
+  max-height: 220px;
+  overflow-y: auto;
+  padding-top: 6px;
+}
+
+/* Settings */
+
+.settings {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 14px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.setting {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+
+.setting strong {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.setting input {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
 /* Page memory footer */
 
 .memory {
